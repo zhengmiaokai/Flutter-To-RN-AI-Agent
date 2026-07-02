@@ -1,0 +1,36 @@
+{
+  "name": "rn-converted-app",
+  "version": "1.0.0",
+  "private": true,
+  "description": "React Native project auto-converted from Flutter",
+  "scripts": {
+    "start": "react-native start",
+    "android": "react-native run-android",
+    "ios": "react-native run-ios",
+    "ts:check": "tsc --noEmit",
+    "lint": "eslint . --ext .ts,.tsx",
+    "test": "jest"
+  },
+  "dependencies": {
+    "react": "^18.3.0",
+    "react-native": "^0.76.0",
+    "@react-navigation/native": "^6.0.0",
+    "@react-navigation/native-stack": "^6.0.0",
+    "react-native-screens": "^3.35.0",
+    "react-native-safe-area-context": "^4.12.0",
+    "react-native-gesture-handler": "^2.20.0",
+    "@react-native-async-storage/async-storage": "^2.0.0",
+    "react-native-fast-image": "^8.6.0"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.25.0",
+    "@babel/preset-env": "^7.25.0",
+    "@babel/runtime": "^7.25.0",
+    "@react-native/babel-preset": "^0.76.0",
+    "@types/react": "^18.3.0",
+    "babel-jest": "^29.7.0",
+    "eslint": "^8.57.0",
+    "jest": "^29.7.0",
+    "typescript": "^5.5.0"
+  }
+}

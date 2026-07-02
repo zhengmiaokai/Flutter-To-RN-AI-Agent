@@ -608,6 +608,10 @@ def _reflect_one_file(
         # exactly what to fix instead of re-generating the same flawed output
         reflection_feedback = _build_reflection_feedback(result)
 
+        # Backup original converted output before re-conversion, so we can
+        # roll back if the new version scores worse than the original.
+        backup_content = converted
+
         reflect_state["status"] = "reconverted"
         reflect_state["reconverted"] = True
         try:
@@ -621,14 +625,24 @@ def _reflect_one_file(
                     flutter_source=original,
                     filename=src_path.name,
                 )
-                if new_result.needs_rework():
-                    console.print(f"  [yellow][Reflect][/yellow] {src_path.name} still below threshold (score={new_result.score}), accepting.")
+
+                # Score guard: revert if re-conversion produced worse output
+                if new_result.score < result.score:
+                    console.print(f"  [yellow][Reflect][/yellow] {src_path.name} re-conversion score ({new_result.score}) dropped from original ({result.score}), reverting.")
+                    output_path.write_text(backup_content, encoding="utf-8")
+                    # Use the original reflect state — the revert is labelled
+                    # "reconverted" so it won't be re-processed next run, but
+                    # the actual converted content is the original.
+                    reflect_state["reverted"] = True
                 else:
-                    console.print(f"  [dim][Reflect][/dim] {src_path.name} score={new_result.score} OK after re-conversion")
-                # Update state with post-reconversion values
-                reflect_state["post_reconversion_score"] = new_result.score
-                reflect_state["post_reconversion_pass"] = new_result.pass_
-                reflect_state["post_reconversion_issues"] = new_result.issues
+                    if new_result.needs_rework():
+                        console.print(f"  [yellow][Reflect][/yellow] {src_path.name} still below threshold (score={new_result.score}), accepting.")
+                    else:
+                        console.print(f"  [dim][Reflect][/dim] {src_path.name} score={new_result.score} OK after re-conversion")
+                    # Update state with post-reconversion values
+                    reflect_state["post_reconversion_score"] = new_result.score
+                    reflect_state["post_reconversion_pass"] = new_result.pass_
+                    reflect_state["post_reconversion_issues"] = new_result.issues
             except Exception as exc:
                 console.print(f"  [yellow][Reflect][/yellow] Re-reflection failed for {src_path.name}: {exc}")
         except Exception as exc:

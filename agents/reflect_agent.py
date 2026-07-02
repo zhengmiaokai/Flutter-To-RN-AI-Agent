@@ -109,8 +109,8 @@ class ReflectResult(BaseModel):
         return sum(1 for i in self.issues if i.get("severity") == "critical")
 
     def needs_rework(self) -> bool:
-        """Return True if re-conversion is needed (score < 85 or any critical)."""
-        return not self.pass_ or self.score < 85 or self.critical_count > 0
+        """Return True if re-conversion is needed (score < 90 or any critical)."""
+        return not self.pass_ or self.score < 90 or self.critical_count > 0
 
 
 _MAX_CODE_CHARS = 16000
@@ -252,7 +252,7 @@ class ReflectAgent(BaseAgent):
         )
         self.log_warn(
             "Reflect",
-            f"Score {result.score} < 85 ({len(result.issues)} issues, "
+            f"Score {result.score} < 90 ({len(result.issues)} issues, "
             f"{result.critical_count} critical). {issue_detail}",
         )
 
