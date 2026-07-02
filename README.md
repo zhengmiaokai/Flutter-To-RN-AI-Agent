@@ -19,7 +19,7 @@
 > **前置要求：** Python 3.12+、Node.js 18+（构建验证阶段需要 `npm` 和 `npx`）
 
 ```bash
-# 1. 创建并激活虚拟环境（推荐）
+# 1. 创建并激活虚拟环境
 python3 -m venv venv
 source venv/bin/activate
 
