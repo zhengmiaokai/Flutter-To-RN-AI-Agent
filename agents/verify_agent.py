@@ -503,11 +503,16 @@ class VerifyAgent(BaseAgent):
     def _run_npm_install(self) -> bool:
         """Run npm install. Returns True on success."""
         import subprocess
-        result = subprocess.run(
-            ["npm", "install"],
-            cwd=str(self._target),
-            capture_output=True, text=True,
-        )
+        try:
+            result = subprocess.run(
+                ["npm", "install"],
+                cwd=str(self._target),
+                capture_output=True, text=True,
+                timeout=120,
+            )
+        except subprocess.TimeoutExpired:
+            self.log_warn("Verify", "npm install timed out (120s)")
+            return False
         if result.returncode != 0:
             self.log_warn("Verify", f"npm install failed: {result.stderr[:500]}")
             return False
