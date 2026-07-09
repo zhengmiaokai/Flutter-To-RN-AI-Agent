@@ -17,6 +17,7 @@ Key LangGraph concepts:
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import shutil
 from pathlib import Path
 from typing import Any, TypedDict
@@ -31,6 +32,7 @@ from agents.scan_agent import ScanAgent
 from agents.convert_agent import ConvertAgent
 from agents.verify_agent import VerifyAgent
 from agents.reflect_agent import ReflectAgent
+from framework.rag import RAGEngine
 from orchestration.setup import ProjectSetup
 
 from langgraph.graph import END, StateGraph
@@ -90,6 +92,7 @@ class Pipeline:
         self._config = config
         self._llm = LLMClient(config)
         self._state = StateManager(config.state_path)
+        self._rag = RAGEngine(config)
         self._graph = self._build_graph()
 
     # =========================================================================
@@ -257,6 +260,28 @@ class Pipeline:
         registry = build_file_registry(file_groups_paths, self._config.target_dir, CATEGORY_MAP)
         converter.set_file_registry(registry)
 
+        # Build RAG index from source files for semantic context retrieval
+        dart_files: list[tuple[Path, str]] = []
+        for cat in ["screens", "widgets", "services", "models", "providers", "utils"]:
+            for p in file_groups_paths.get(cat, []):
+                dart_files.append((p, cat))
+
+        # Skip RAG index rebuild if source files haven't changed
+        rag_source_hash = _compute_source_hash(dart_files)
+        rag_index_state = self._state.get_phase_data("rag_index")
+        if rag_index_state.get("source_hash") == rag_source_hash:
+            console.print(f"  [dim]RAG index already up-to-date, skipping rebuild.[/dim]")
+            converter.set_rag_engine(self._rag)
+            reflector.set_rag_engine(self._rag)
+        else:
+            console.print(f"  [dim]Building RAG index from {len(dart_files)} files...[/dim]")
+            indexed = self._rag.build_index(dart_files)
+            if indexed > 0:
+                converter.set_rag_engine(self._rag)
+                reflector.set_rag_engine(self._rag)
+                console.print(f"  [dim]RAG index built: {indexed} chunks indexed[/dim]")
+                self._state.set_phase_data("rag_index", {"source_hash": rag_source_hash})
+
         # Parallel conversion with ThreadPoolExecutor
         stats = {"success": 0, "failed": 0}
 
@@ -288,6 +313,18 @@ class Pipeline:
         for category, src_path in sample_items:
             _reflect_one_file(self._config, converter, reflector, category, src_path, self._state)
 
+        # Index converted TS files for VerifyAgent's RAG type retrieval
+        if self._rag.is_indexed:
+            ts_hash = _compute_ts_dir_hash(self._config.target_dir)
+            rag_index_state = self._state.get_phase_data("rag_index")
+            if rag_index_state.get("ts_hash") == ts_hash:
+                console.print(f"  [dim]TS output index already up-to-date, skipping.[/dim]")
+            else:
+                ts_indexed = self._rag.index_ts_files(self._config.target_dir)
+                if ts_indexed > 0:
+                    console.print(f"  [dim]TS output indexed: {ts_indexed} chunks for verify[/dim]")
+                    self._state.set_phase_data("rag_index", {"ts_hash": ts_hash})
+
         # ── Persist phase data ─────────────────────────────────────────────
         self._state.set_phase_data("convert", {
             "converted_count": stats["success"],
@@ -312,6 +349,8 @@ class Pipeline:
         self._state.clear_phase_files("verify")
 
         verifier = VerifyAgent(self._config, self._llm)
+        if self._rag.is_indexed:
+            verifier.set_rag_engine(self._rag)
 
         attempt = state.get("verify_attempts", 0)
 
@@ -478,6 +517,41 @@ class Pipeline:
 # =============================================================================
 # Standalone node helpers (used inside graph phases)
 # =============================================================================
+
+
+def _compute_source_hash(files: list[tuple[Path, str]]) -> str:
+    """Compute a deterministic hash of source files for RAG index persistence.
+
+    Uses (path, size, mtime) to detect any file change.
+    """
+    h = hashlib.md5()
+    for file_path, category in sorted(files, key=lambda x: str(x[0])):
+        try:
+            st = file_path.stat()
+            h.update(f"{file_path}|{st.st_size}|{st.st_mtime}|{category}".encode())
+        except OSError:
+            pass
+    return h.hexdigest()
+
+
+def _compute_ts_dir_hash(target_dir: str) -> str:
+    """Compute a hash of all TS/TSX files in target dir for index persistence."""
+    h = hashlib.md5()
+    base = Path(target_dir)
+    if not base.exists():
+        return h.hexdigest()
+    for fp in sorted(base.rglob("*")):
+        if fp.suffix not in (".ts", ".tsx"):
+            continue
+        rel = fp.relative_to(base)
+        if any(p.startswith(".") or p == "node_modules" for p in rel.parts):
+            continue
+        try:
+            st = fp.stat()
+            h.update(f"{rel}|{st.st_size}|{st.st_mtime}".encode())
+        except OSError:
+            pass
+    return h.hexdigest()
 
 
 def _convert_one_file(

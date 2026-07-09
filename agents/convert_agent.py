@@ -5,6 +5,15 @@ read before the call, so the tool-calling loop adds only token cost and latency
 without benefit. Per-category system prompts avoid sending irrelevant mapping
 tables (e.g. models don't need widget or navigation mappings).
 
+RAG enhancement:
+  When a RAGEngine is provided via set_rag_engine(), the agent also retrieves
+  semantically related code chunks from the project index and appends them as
+  context. This replaces the basic filename-based companion context lookup
+  with cross-file semantic understanding.
+
+  RAG mode is optional — if no engine is set, falls back to the original
+  companion file logic.
+
 Estimated token reduction: ~50-60% vs the previous ReAct agent approach.
 """
 
@@ -183,10 +192,20 @@ class ConvertAgent(BaseAgent):
         super().__init__(config, llm)
         self._state = state
         self._file_registry: FileRegistry = {}
+        self._rag_engine: "RAGEngine | None" = None  # noqa: F821
 
     def set_file_registry(self, registry: FileRegistry):
         """Set the project-wide file registry for context-aware conversion."""
         self._file_registry = registry
+
+    def set_rag_engine(self, engine: "RAGEngine"):  # noqa: F821
+        """Attach a RAG engine for semantic context retrieval.
+
+        When set, the agent retrieves semantically related code chunks
+        from the project index and includes them in the conversion prompt,
+        replacing the basic filename-based companion context lookup.
+        """
+        self._rag_engine = engine
 
     # ---- Quick single-file conversion (used by pipeline) -------------------
 
@@ -233,12 +252,23 @@ class ConvertAgent(BaseAgent):
         source_code = src_path.read_text(encoding="utf-8")
         prompt = get_conversion_prompt(source_code, src_path.name)
 
-        # Build compact companion context
+        # Build compact companion context (filename-based + import-based)
         companion_context = ""
         if self._file_registry:
             companions = find_companion_context(src_path.name, self._file_registry, source_code=source_code)
             if companions:
                 companion_context = build_context_prompt(companions)
+
+        # RAG-enhanced context (semantic retrieval — supplements companion context)
+        rag_context = ""
+        if self._rag_engine is not None:
+            results = self._rag_engine.retrieve_context(
+                query_code=source_code,
+                filename=src_path.name,
+                k=5,
+            )
+            if results:
+                rag_context = self._rag_engine.format_retrieved_context(results, src_path.name)
 
         # Category-specific system prompt (core + relevant sections only)
         system_prompt = build_category_system_prompt(category)
@@ -259,6 +289,10 @@ class ConvertAgent(BaseAgent):
                 f"Their output paths show where they will be located — use relative "
                 f"imports from your location ({subdir}/{output_name}).\n\n"
             )
+
+        # RAG context block (injected after companion context, before reflection)
+        if rag_context:
+            user_content += f"{rag_context}\n\n"
 
         # Inject reflection feedback when re-converting (guides the LLM to fix
         # specific issues found during quality review, rather than re-generating

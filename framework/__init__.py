@@ -16,6 +16,7 @@ Modules:
 
 from framework.config import Config, get_config, init_config
 from framework.llm import LLMClient
+from framework.rag import RAGEngine
 from framework.state import StateManager
 from framework.state_machine import StateMachine, StepResult, StepStatus
 
@@ -23,4 +24,5 @@ __all__ = [
     "Config", "get_config", "init_config",
     "LLMClient", "StateManager",
     "StateMachine", "StepResult", "StepStatus",
+    "RAGEngine",
 ]

@@ -189,6 +189,11 @@ class VerifyAgent(BaseAgent):
         self._target = Path(config.target_dir)
         # Populated after each _auto_fix cycle: {filename: {fixed, error_categories, ...}}
         self.last_fix_results: dict[str, dict] = {}
+        self._rag_engine = None
+
+    def set_rag_engine(self, engine):
+        """Attach a RAG engine for semantic type definition retrieval."""
+        self._rag_engine = engine
 
     # ---- Structured error fix -------------------------------------------------
 
@@ -270,16 +275,63 @@ class VerifyAgent(BaseAgent):
         return success_count
 
     def _build_cross_file_context(self, error_group: TscErrorGroup) -> str:
-        """Collect export signatures from companion files imported by error files.
+        """Collect type definition context for fixing errors.
 
-        For each file with errors, scans its import statements and extracts
-        the exports/interfaces/types from the resolved companion files.
-        This helps the agent fix import paths and resolve type references.
+        Two strategies, tried in order:
+          1. RAG: query the vector store with error messages to find type
+             definitions semantically (covers indirect types like Context generics,
+             inherited interfaces, etc.).
+          2. Fallback: scan imports for direct companion file exports
+             (original approach).
+
+        The RAG approach is strictly better — it retrieves type definitions
+        even when the erroring file doesn't directly import the type file
+        (e.g. types from Context providers, navigator params, etc.).
         """
+        # ── Strategy 1: RAG-based type definition retrieval ──────────────
+        if self._rag_engine is not None:
+            context_parts = []
+            seen_content: set[str] = set()
+
+            for filename in error_group.file_fix_order[:5]:
+                file_path = self._resolve_file(filename)
+                if not file_path or not file_path.exists():
+                    continue
+                try:
+                    source = file_path.read_text(encoding="utf-8")
+                except Exception:
+                    continue
+
+                # Build query from: error file content + error messages
+                file_errors = error_group.by_file.get(filename, [])
+                error_text = " ".join(f"{e.code}: {e.message}" for e in file_errors[:3])
+
+                # Query with the file's source code + error messages
+                query = f"{error_text}\n{source[:1500]}"
+                results = self._rag_engine.retrieve_context(
+                    query_code=query,
+                    filename=filename,
+                    k=4,
+                    score_threshold=0.25,
+                )
+
+                # Filter to only TS output types (not issue patterns)
+                type_results = [r for r in results if r.get("type") == "ts_output"]
+                if type_results:
+                    formatted = self._rag_engine.format_type_context(type_results)
+                    if formatted not in seen_content:
+                        seen_content.add(formatted)
+                        context_parts.append(formatted)
+
+            if context_parts:
+                return "\n\n".join(context_parts)
+
+            # If RAG returned nothing useful, fall through to Strategy 2
+
+        # ── Strategy 2: Import-scan fallback (original) ──────────────────
         context_parts = []
         seen: set[str] = set()
 
-        # Top 5 files with errors — scan their imports for context
         for filename in error_group.file_fix_order[:5]:
             file_path = self._resolve_file(filename)
             if not file_path or not file_path.exists():
@@ -289,9 +341,8 @@ class VerifyAgent(BaseAgent):
             except Exception:
                 continue
 
-            # Find all relative imports in the file
             imports = re.findall(r"from\s+['\"](\.\.?/[^'\"]+)['\"]", source)
-            for imp in imports[:5]:  # limit per file
+            for imp in imports[:5]:
                 resolved = self._resolve_import_from_string(filename, imp)
                 if resolved and resolved.exists() and str(resolved) not in seen:
                     seen.add(str(resolved))
