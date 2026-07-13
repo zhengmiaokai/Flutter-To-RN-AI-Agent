@@ -87,48 +87,48 @@ Flutter-to-RN 是一个 **AI 驱动的自动化代码转换工具**，将 Flutte
 
 ```
  ┌───────────────────────────────────────────────────┐
- │                    CLI 入口                         │
- │                   main.py                          │
+ │                    CLI 入口                        │
+ │                    main.py                        │
  └───────────────────────┬───────────────────────────┘
                          │
  ┌───────────────────────▼───────────────────────────┐
- │                    编排层                           │
- │               orchestration/                       │
- │        LangGraph StateGraph · 5 阶段 Pipeline       │
- │     Setup → Scan → Copy Assets → Convert → Verify  │
+ │                    编排层                          │
+ │               orchestration/                      │
+ │       LangGraph StateGraph · 5 阶段 Pipeline       │
+ │   Setup → Scan → Copy Assets → Convert → Verify   │
  └───────────────────────┬───────────────────────────┘
                          │
  ┌───────────────────────▼───────────────────────────┐
  │                   Agent 层                         │
- │                   agents/                          │
- │   ScanAgent       ConvertAgent    ReflectAgent     │
- │   VerifyAgent     BaseAgent                        │
- │   (各阶段核心逻辑 + RAG 检索 (Convert/Verify))        │
+ │                   agents/                         │
+ │    ScanAgent       ConvertAgent    ReflectAgent   │
+ │    VerifyAgent     BaseAgent                      │
+ │    (各阶段核心逻辑 + RAG 检索 (Convert/Verify))      │
  └───────────────────────┬───────────────────────────┘
                          │
  ┌───────────────────────▼───────────────────────────┐
  │                   Tools 层                         │
- │                   tools/                           │
- │    8 个 @tool 函数 · 全局注册表 TOOLS                 │
+ │                    tools/                         │
+ │        8 个 @tool 函数 · 全局注册表 TOOLS            │
  └───────────────────────┬───────────────────────────┘
                          │
  ┌───────────────────────▼───────────────────────────┐
  │                  Prompts 层                        │
- │                  prompts/                          │
- │    按文件类别组合差异化 LLM 提示词                     │
+ │                   prompts/                        │
+ │           按文件类别组合差异化 LLM 提示词              │
  └───────────────────────┬───────────────────────────┘
                          │
  ┌───────────────────────▼───────────────────────────┐
  │                  Framework 层                      │
- │                  framework/                        │
- │   config / llm / state / state_machine / rag       │
- │   (Chroma 向量库 · 双嵌入策略 · 两类索引)              │
+ │                  framework/                       │
+ │    config / llm / state / state_machine / rag     │
+ │       (Chroma 向量库 · 双嵌入策略 · 两类索引)         │
  └───────────────────────┬───────────────────────────┘
                          │
  ┌───────────────────────▼───────────────────────────┐
  │                 Templates 层                       │
- │                 templates/                         │
- │   package.json / App.tsx / AppNavigator.tsx / ...  │
+ │                 templates/                        │
+ │  package.json / App.tsx / AppNavigator.tsx / ...  │
  └───────────────────────────────────────────────────┘
 ```
 
