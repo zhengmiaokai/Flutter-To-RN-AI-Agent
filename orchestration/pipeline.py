@@ -272,13 +272,11 @@ class Pipeline:
         if rag_index_state.get("source_hash") == rag_source_hash:
             console.print(f"  [dim]RAG index already up-to-date, skipping rebuild.[/dim]")
             converter.set_rag_engine(self._rag)
-            reflector.set_rag_engine(self._rag)
         else:
             console.print(f"  [dim]Building RAG index from {len(dart_files)} files...[/dim]")
             indexed = self._rag.build_index(dart_files)
             if indexed > 0:
                 converter.set_rag_engine(self._rag)
-                reflector.set_rag_engine(self._rag)
                 console.print(f"  [dim]RAG index built: {indexed} chunks indexed[/dim]")
                 self._state.set_phase_data("rag_index", {"source_hash": rag_source_hash})
 

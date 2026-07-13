@@ -158,21 +158,10 @@ class ReflectAgent(BaseAgent):
     2. Fall back to plain chat + JSON parsing when structured output is
        unavailable (e.g., models that don't support tool calling).
 
-    RAG integration:
-      When a RAGEngine is attached, before each reflection it retrieves
-      issue patterns from previously reflected files. Patterns matching
-      the current file's code are injected as warnings, helping the LLM
-      catch recurring mistakes. After reflection, any new issues found
-      are stored back into the index for future files.
     """
 
     def __init__(self, config: Config, llm: LLMClient):
         super().__init__(config, llm)
-        self._rag_engine = None
-
-    def set_rag_engine(self, engine):
-        """Attach a RAG engine for cross-file issue pattern awareness."""
-        self._rag_engine = engine
 
     def reflect(
         self,
@@ -208,15 +197,6 @@ class ReflectAgent(BaseAgent):
             f"## Converted React Native Code\n"
             f"```typescript\n{rn_code[:_MAX_CODE_CHARS]}\n```\n\n"
         )
-
-        # RAG: retrieve issue patterns from previously reflected files
-        if self._rag_engine is not None:
-            patterns = self._rag_engine.retrieve_issue_patterns(
-                query=flutter_source[:2000], k=3,
-            )
-            if patterns:
-                pattern_block = self._rag_engine.format_issue_patterns(patterns)
-                msg_content += f"{pattern_block}\n\n"
 
         msg_content += "Output the quality report now."
 
@@ -261,17 +241,6 @@ class ReflectAgent(BaseAgent):
                 pass_=False, score=50,
                 summary="Reflection skipped due to error.",
             )
-
-        # RAG: store issues as patterns for future files
-        if self._rag_engine is not None and result.issues:
-            for issue in result.issues:
-                self._rag_engine.add_issue_pattern(
-                    flutter_file=filename,
-                    issue_description=issue.get("description", ""),
-                    issue_category=issue.get("category", "other"),
-                    severity=issue.get("severity", "warning"),
-                    filename=filename,
-                )
 
         return result
 

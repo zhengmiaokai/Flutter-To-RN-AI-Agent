@@ -309,80 +309,6 @@ class RAGEngine:
         ids = self._vectorstore.add_documents(all_docs)
         return len(ids)
 
-    # ── Issue pattern storage (for ReflectAgent + VerifyAgent) ────────────
-
-    def add_issue_pattern(
-        self,
-        flutter_file: str,
-        issue_description: str,
-        issue_category: str,
-        severity: str = "warning",
-        filename: str = "",
-    ):
-        """Store a reflection/verification issue as a retrievable pattern.
-
-        Args:
-            flutter_file: Source file name where the issue was found.
-            issue_description: Human-readable description of the issue.
-            issue_category: Category (widget, state, import, type, etc.).
-            severity: critical / warning / info.
-            filename: Short display name for the file.
-        """
-        self._ensure_init()
-        if self._vectorstore is None:
-            return
-        doc = Document(
-            page_content=f"[{severity.upper()}] {issue_category}: {issue_description}",
-            metadata={
-                "source": flutter_file,
-                "file": filename or flutter_file,
-                "type": "issue_pattern",
-                "issue_category": issue_category,
-                "severity": severity,
-            },
-        )
-        self._vectorstore.add_documents([doc])
-
-    def retrieve_issue_patterns(
-        self,
-        query: str,
-        k: int = 3,
-        score_threshold: float | None = 0.25,
-    ) -> list[dict]:
-        """Retrieve similar issue patterns from previous reflections.
-
-        Args:
-            query: The issue context (e.g. source code snippet or category).
-            k: Number of patterns to retrieve.
-            score_threshold: Minimum relevance score.
-
-        Returns:
-            List of dicts with 'content', 'issue_category', 'severity', 'source'.
-        """
-        self._ensure_init()
-        if self._vectorstore is None:
-            return []
-        retriever = self._vectorstore.as_retriever(
-            search_type="similarity_score_threshold" if score_threshold else "similarity",
-            search_kwargs={"k": k, "score_threshold": score_threshold}
-            if score_threshold
-            else {"k": k},
-        )
-        try:
-            docs = retriever.invoke(query)
-        except Exception:
-            return []
-
-        results = []
-        for doc in docs:
-            results.append({
-                "content": doc.page_content,
-                "issue_category": doc.metadata.get("issue_category", "other"),
-                "severity": doc.metadata.get("severity", "warning"),
-                "source": doc.metadata.get("source", "unknown"),
-            })
-        return results
-
     # ── Generic context retrieval ─────────────────────────────────────────
 
     def retrieve_context(
@@ -459,22 +385,6 @@ class RAGEngine:
             "\nNOTE: The code above is from related files. "
             "Use them for cross-file context — import their converted RN "
             "counterparts instead of redefining types."
-        )
-        return "\n".join(lines)
-
-    def format_issue_patterns(self, results: list[dict]) -> str:
-        """Format retrieved issue patterns into a reflection prompt warning block."""
-        if not results:
-            return ""
-        lines = [
-            "## ⚠️ Known issue patterns from other files in this project:",
-        ]
-        for r in results:
-            lines.append(f"- [{r['severity'].upper()}] ({r['issue_category']}) {r['content']}")
-            lines.append(f"  (occurred in: {r['source']})")
-        lines.append(
-            "\nPay extra attention to these patterns — they were flagged in "
-            "other files and may also apply here."
         )
         return "\n".join(lines)
 
