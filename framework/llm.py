@@ -1,15 +1,17 @@
-"""framework/llm — LangChain ChatOpenAI-powered LLM client.
+"""framework/llm — ChatOpenAI instance pool for any number of routed models.
 
-Replaces the raw openai.OpenAI client with LangChain's ChatOpenAI,
-bringing streaming, structured output, and token tracking support.
-Compatible with any OpenAI-compatible API (DeepSeek, Ollama, etc.).
+The harness is the only LLM entry point. Model routing lets each task talk to
+its own model (config.model_routes / MODEL_ROUTES), so the pool holds one
+ChatOpenAI instance per (base_url, model, api_key) connection. Calls without
+a route fall back to the global model (config.model / --model). Per-task
+adaptation happens at the call level: the harness sizes each request
+(max_tokens etc.) via invoke kwargs.
 """
 
 from __future__ import annotations
 
 from typing import Any, Optional
 
-from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langchain.agents import create_agent
 
@@ -17,109 +19,66 @@ from framework.config import Config
 
 
 class LLMClient:
-    """LangChain-based LLM client.
-
-    Wraps ChatOpenAI to work with any OpenAI-compatible provider.
-    Supports the original chat()/chat_with_messages() API for backward
-    compatibility, plus direct access to the ChatOpenAI instance for
-    use with create_agent() (from langchain.agents) and LangGraph workflows.
-
-    Key LangChain features used:
-    - ChatOpenAI (provider-agnostic, supports function/tool calling)
-    - Structured output via .with_structured_output()
-    - Streaming via .stream()
-    - Tool binding for ReAct agents
-    """
+    """Pool of ChatOpenAI instances for any OpenAI-compatible provider."""
 
     def __init__(self, config: Config):
         self._config = config
-        self._llm: Optional[ChatOpenAI] = None
+        self._pool: dict[str, ChatOpenAI] = {}
 
-    # ---- LangChain ChatOpenAI instance --------------------------------------
+    # ---- instance pool ---------------------------------------------------
 
-    @property
-    def llm(self) -> ChatOpenAI:
-        """Get the underlying ChatOpenAI instance.
+    def _pool_key(self, model: str, base_url: Optional[str], api_key: Optional[str]) -> str:
+        return f"{base_url or ''}|{model}|{api_key or ''}"
 
-        Use this directly for LangChain agent creation and advanced features.
+    def get_llm(
+        self,
+        model: Optional[str] = None,
+        base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+    ) -> ChatOpenAI:
+        """Get (and lazily create) the ChatOpenAI instance for a connection.
+
+        Any arg left unset falls back to the global config, so get_llm() with
+        no args returns the global model's instance (unchanged behavior).
         """
-        if self._llm is None:
+        model = model or self._config.model
+        base_url = base_url or self._config.base_url
+        api_key = api_key or self._config.api_key
+        key = self._pool_key(model, base_url, api_key)
+        llm = self._pool.get(key)
+        if llm is None:
             kwargs: dict[str, Any] = {
-                "model": self._config.model,
-                "api_key": self._config.api_key,
+                "model": model,
+                "api_key": api_key,
                 "temperature": 0.2,
                 "timeout": self._config.timeout,
                 "max_retries": self._config.llm_max_retries,
-                "max_tokens": 4096,
             }
-            if self._config.base_url:
-                kwargs["base_url"] = self._config.base_url
-            self._llm = ChatOpenAI(**kwargs)
-        return self._llm
+            if base_url:
+                kwargs["base_url"] = base_url
+            llm = ChatOpenAI(**kwargs)
+            self._pool[key] = llm
+        return llm
 
-    # ---- Backward-compatible chat API (powered by LangChain) -----------------
-
-    def chat(self, system_prompt: str, user_message: str, **kwargs) -> str:
-        """Send a chat completion and return the response text.
-
-        Internally uses ChatOpenAI.invoke() for LangChain-powered completions.
-        """
-        temperature = kwargs.pop("temperature", 0.2)
-        messages = [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=user_message),
-        ]
-        response = self.llm.invoke(messages, **{"temperature": temperature, **kwargs})
-        return response.content
-
-    def chat_with_messages(self, messages: list[dict], **kwargs) -> str:
-        """Send a multi-turn chat completion.
-
-        Accepts OpenAI-format message dicts and converts them to
-        LangChain message objects internally.
-        """
-        from langchain_core.messages import BaseMessage
-
-        temperature = kwargs.pop("temperature", 0.2)
-        lc_messages: list[BaseMessage] = []
-        for msg in messages:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            if role == "system":
-                lc_messages.append(SystemMessage(content=content))
-            elif role == "user":
-                lc_messages.append(HumanMessage(content=content))
-            else:
-                lc_messages.append(HumanMessage(content=content))
-
-        response = self.llm.invoke(lc_messages, **{"temperature": temperature, **kwargs})
-        return response.content
-
-    # ---- LangGraph agent factory --------------------------------------------
+    # ---- ReAct agent factory ----------------------------------------------
 
     def create_agent(
         self,
         tools: list,
         system_prompt: str,
         name: str = "agent",
+        model: Optional[str] = None,
+        base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
     ):
-        """Create a LangGraph ReAct agent bound to this LLM.
+        """Build a compiled LangGraph ReAct agent bound to this client's model.
 
-        Args:
-            tools: List of LangChain @tool-decorated functions or BaseTool objects.
-            system_prompt: System prompt for the agent.
-            name: Agent name for graph node identification.
-
-        Returns:
-            A compiled LangGraph agent (callable via .invoke()).
+        Returns a CompiledStateGraph callable via .invoke({"messages": [...]}).
         """
+        llm = self.get_llm(model=model, base_url=base_url, api_key=api_key)
         return create_agent(
-            model=self.llm,
-            tools=tools,
+            model=llm,
+            tools=list(tools),
             system_prompt=system_prompt,
             name=name,
         )
-
-    def chat_prompt(self, system_prompt: str, user_message: str, **kwargs) -> str:
-        """Alias for chat() — for readability."""
-        return self.chat(system_prompt, user_message, **kwargs)

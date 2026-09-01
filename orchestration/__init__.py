@@ -3,8 +3,8 @@
 Coordinates the 5-phase pipeline using LangGraph's StateGraph:
 1. Setup   → initialize target React Native output environment
 2. Scan    → ScanAgent: classify source files by type (rule-based)
-3. Convert → LLM-driven code generation via ReAct agents + quality reflection
-4. Verify  → build check + AI auto-fix (graph-based retry loop)
+3. Convert → single-shot LLM conversion via Harness + quality reflection
+4. Verify  → tsc build check + AI auto-fix (graph-based retry loop)
 
 Key LangGraph concepts used:
 - StateGraph with typed shared state (PipelineState via TypedDict)

@@ -1,12 +1,8 @@
-"""agents/verify_agent — Build verification with LangGraph ReAct agents.
+"""agents/verify_agent — Build verification and structured error auto-fix.
 
-Verifies the generated React Native project builds correctly using a
-LangGraph ReAct agent bound to build-check and auto-fix tools.
-
-Key LangChain/LangGraph features:
-- create_react_agent with run_build_check tool
-- ReAct tool calling loop for build → parse errors → fix → recheck
-- @tool-decorated utility functions
+Verifies the generated React Native project builds correctly: tsc --noEmit →
+structured error parsing → single-shot harness fix per file → re-verify via
+the pipeline StateMachine retry loop.
 """
 
 from __future__ import annotations
@@ -19,15 +15,29 @@ from typing import Optional
 from langchain_core.messages import HumanMessage
 
 from framework.config import Config
-from framework.llm import LLMClient
+from framework.harness import BudgetExceededError
 from agents.base import BaseAgent
-from tools import (
-    read_source_file,
-    write_output_file,
-    run_build_check,
-    run_tsc_check,
+from tools import VERIFY_FIX_TOOLS
+from prompts.verify import (
+    BUILD_FIX_SYSTEM,
+    get_fix_prompt,
+    HYBRID_FIX_SYSTEM,
+    get_hybrid_fix_prompt,
 )
-from prompts.verify import BUILD_FIX_SYSTEM, get_fix_prompt
+
+# Cap on source code sent to the fix prompt (bounds per-call token cost).
+_MAX_FIX_SOURCE_CHARS = 16000
+
+_CODE_BLOCK_RE = re.compile(
+    r"```(?:tsx|typescript|ts|jsx|javascript|js|json)\n(.*?)```",
+    re.DOTALL,
+)
+
+
+def _extract_code_block(text: str) -> str | None:
+    """Extract the first fenced code block from an LLM response."""
+    m = _CODE_BLOCK_RE.search(text or "")
+    return m.group(1).strip() if m else None
 
 
 # =============================================================================
@@ -174,34 +184,38 @@ def parse_tsc_errors(output: str, target_dir: str = "") -> TscErrorGroup:
 class VerifyAgent(BaseAgent):
     """Agent that verifies the generated React Native project builds correctly.
 
-    Uses a LangGraph ReAct agent for the build-verify-fix loop. The agent
-    calls run_build_check → reads error files → transforms code → writes fix.
-
-    Enhanced with:
+    Fixes build errors with a single-shot harness call per file (no tool
+    loop), enhanced with:
     - Structured tsc error parsing and categorization
-    - Cross-file context for import resolution
-    - Self-verifying fix loop (read → fix → run_tsc_check → iterate)
     - Priority-ordered multi-file fixing (import errors first)
+    - Cross-file context for import resolution
+    - RAG-based type definition retrieval and fix-memo injection
     """
 
-    def __init__(self, config: Config, llm: LLMClient):
-        super().__init__(config, llm)
+    def __init__(self, config: Config, harness=None):
+        super().__init__(config, harness)
         self._target = Path(config.target_dir)
         # Populated after each _auto_fix cycle: {filename: {fixed, error_categories, ...}}
         self.last_fix_results: dict[str, dict] = {}
         self._rag_engine = None
+        self._memory = None
 
     def set_rag_engine(self, engine):
         """Attach a RAG engine for semantic type definition retrieval."""
         self._rag_engine = engine
 
+    def set_memory_store(self, store):
+        """Attach the memory store for fix-memo injection (advisory only)."""
+        self._memory = store
+
     # ---- Structured error fix -------------------------------------------------
 
-    def _auto_fix_with_agent(self, errors: str) -> int:
-        """Use the ReAct agent to auto-fix build errors.
+    def _auto_fix(self, errors: str) -> int:
+        """Auto-fix build errors with a structured per-file pass.
 
         Parses tsc errors into structured groups, orders files by fix
-        priority, and fixes each file with a self-verifying agent loop.
+        priority (import errors first), and fixes each file with a single
+        harness call.
         """
         # Parse errors into structured groups
         error_group = parse_tsc_errors(errors, str(self._target))
@@ -406,6 +420,65 @@ class VerifyAgent(BaseAgent):
 
     # ---- Enhanced per-file fix ------------------------------------------------
 
+    def _fix_file(
+        self,
+        file_path: Path,
+        errors: str,
+        filename: str,
+        file_error_group: Optional[list[TscError]] = None,
+        cross_file_context: str = "",
+    ) -> bool:
+        """Fix a single file with a single-shot harness call (no tool loop).
+
+        One harness.call(task_type="verify_fix") returns the complete
+        corrected file, which we write and let the outer StateMachine verify
+        with tsc. Works with any model, including reasoning-type models that
+        lack function calling.
+        """
+        try:
+            source = file_path.read_text(encoding="utf-8")
+        except Exception:
+            return False
+
+        prompt = get_hybrid_fix_prompt(
+            source[:_MAX_FIX_SOURCE_CHARS],
+            errors,
+            filename,
+            cross_file_context,
+        )
+
+        # Inject known fixes from previous runs for this error code (advisory)
+        if self._memory is not None and file_error_group:
+            codes = sorted({e.code for e in file_error_group})
+            memo = self._memory.query_fix_memos(codes)
+            if memo:
+                prompt += f"\n\n{memo}"
+
+        try:
+            if not self.harness:
+                return False
+            result = self.harness.call(
+                task_type="verify_fix",
+                system_prompt=HYBRID_FIX_SYSTEM,
+                user_message=prompt,
+                temperature=0.2,
+                category=self._file_category(filename),
+            )
+        except Exception as exc:
+            self.log_warn("Verify", f"Fix call failed for {filename}: {exc}")
+            return False
+
+        code = _extract_code_block(result.content)
+        if not code or len(code) < 50:
+            self.log_warn("Verify", f"No valid fix produced for {filename}")
+            return False
+
+        file_path.write_text(code, encoding="utf-8")
+        self.log_info("Verify", f"Applied hybrid fix to {filename}")
+        return True
+
+    # ---- ReAct self-verifying fix --------------------------------------------
+
     def _fix_with_agent(
         self,
         file_path: Path,
@@ -414,140 +487,153 @@ class VerifyAgent(BaseAgent):
         file_error_group: Optional[list[TscError]] = None,
         cross_file_context: str = "",
     ) -> bool:
-        """Fix a single file using the LangGraph ReAct agent with self-verification.
+        """Fix a single file with a self-verifying ReAct tool loop.
 
-        The agent is given `read_source_file`, `write_output_file`, and
-        `run_tsc_check` tools so it can:
-        1. Read the current file
-        2. Write the corrected code
-        3. Run tsc to verify
-        4. Iterate if errors remain
-
-        Only returns True if write_output_file was actually called or a
-        valid code block was extracted.
+        The agent is given read_source_file / write_output_file /
+        run_tsc_check / run_build_check so it can read companion files, write
+        the fix, and run tsc to verify BEFORE returning — unlike the
+        single-shot path, which writes blindly and lets the outer loop catch
+        failures. Falls back to single-shot `_fix_file` when the ReAct agent
+        is unavailable (e.g. model without function calling) or produced no
+        write.
         """
         try:
             source = file_path.read_text(encoding="utf-8")
+        except Exception:
+            return False
 
-            # Build enhanced prompt with categorized errors + cross-file context
-            category_labels = []
-            if file_error_group:
-                seen_cats = set()
-                for e in file_error_group:
-                    if e.category not in seen_cats:
-                        seen_cats.add(e.category)
-                        category_labels.append(e.category)
-            category_hint = ", ".join(category_labels) if category_labels else "mixed"
+        prompt = get_fix_prompt(source, errors, filename)
+        if cross_file_context:
+            prompt += f"\n\n## Companion File Context (exports from imported files)\n{cross_file_context}"
 
-            prompt = get_fix_prompt(source, errors, filename)
+        # Inject known fixes from previous runs for this error code (advisory)
+        if self._memory is not None and file_error_group:
+            codes = sorted({e.code for e in file_error_group})
+            memo = self._memory.query_fix_memos(codes)
+            if memo:
+                prompt += f"\n\n{memo}"
 
-            # Append cross-file context if available
-            if cross_file_context:
-                prompt += f"\n\n## Companion File Context (exports from imported files)\n{cross_file_context}"
+        if self.llm is None:
+            return self._fix_file(
+                file_path, errors, filename, file_error_group, cross_file_context,
+            )
 
-            # Collect additional error context — show top errors from OTHER files too
-            # so the agent understands inter-file dependencies
-            prompt += f"\n\nFile categories being fixed: {category_hint}"
+        # Budget guard: the ReAct loop's internal calls bypass Harness.call, so
+        # consult the shared ledger once up front. Exhausted → abort the loop
+        # and let the pipeline stop the verify phase (gave_up) instead of
+        # burning more tokens. Raised before the try so the single-shot
+        # fallback below isn't triggered (it would fail identically).
+        if self.harness is not None and self.harness.over_budget():
+            raise BudgetExceededError(
+                f"Token budget ({self.config.token_budget}) exhausted — "
+                f"skipping ReAct fix for {filename}."
+            )
 
-            if self.llm:
-                agent = self.create_agent(
-                    tools=[
-                        read_source_file,
-                        write_output_file,
-                        run_tsc_check,
-                        run_build_check,
-                    ],
-                    system_prompt=BUILD_FIX_SYSTEM,
-                    name="fix_agent",
-                )
-
-                result = agent.invoke({
+        # ReAct agent with self-verification tools
+        abs_path = str(file_path.resolve())
+        abs_target = str(self._target.resolve())
+        route = self.config.route_for("verify_fix")
+        try:
+            agent = self.create_agent(
+                tools=VERIFY_FIX_TOOLS,
+                system_prompt=BUILD_FIX_SYSTEM,
+                name="fix_agent",
+                model=route.model,
+                base_url=route.base_url,
+                api_key=route.api_key,
+            )
+            result = agent.invoke(
+                {
                     "messages": [
                         HumanMessage(
                             content=(
-                                f"Fix the build errors in {filename}.\n\n"
-                                f"{prompt}\n\n"
+                                f"Fix the build errors in {filename}.\n\n{prompt}\n\n"
                                 f"## Instructions\n"
-                                f"1. Read the file: use read_source_file('{file_path}')\n"
-                                f"2. Write the corrected code: use write_output_file\n"
-                                f"3. Verify:\n"
-                                f"   - First use run_build_check(target_dir='{self._target}')\n"
-                                f"     to run a full build (npm install + tsc).\n"
-                                f"   - If node_modules already exist, use\n"
-                                f"     run_tsc_check(target_dir='{self._target}') for faster\n"
-                                f"     iteration.\n"
-                                f"4. If BUILD_ERRORS appear, read the file and fix again\n"
-                                f"5. Stop when run_tsc_check or run_build_check returns BUILD_OK\n\n"
-                                f"Target directory: {self._target}"
+                                f"1. Read the file: use read_source_file('{abs_path}')\n"
+                                f"2. Write the corrected file: use write_output_file "
+                                f"(output_path='{abs_path}')\n"
+                                f"3. Verify: use run_tsc_check(target_dir='{abs_target}').\n"
+                                f"   If node_modules are missing, first use "
+                                f"run_build_check(target_dir='{abs_target}').\n"
+                                f"4. If BUILD_ERRORS remain, read the file again and "
+                                f"fix, then verify again.\n"
+                                f"5. Stop when run_tsc_check returns BUILD_OK.\n"
+                                f"Target directory: {abs_target}"
                             )
                         ),
                     ]
-                })
+                },
+                config={"recursion_limit": 20},
+            )
+        except Exception as exc:
+            self.log_warn("Verify", f"ReAct fix failed for {filename}: {exc}")
+            return self._fix_file(
+                file_path, errors, filename, file_error_group, cross_file_context,
+            )
 
-                # ---- Check if write_output_file was called in ANY turn ----
-                tool_wrote = False
-                for msg in result["messages"]:
-                    if hasattr(msg, "additional_kwargs") and msg.additional_kwargs:
-                        for tc in msg.additional_kwargs.get("tool_calls", []):
-                            func_name = ""
-                            if isinstance(tc, dict):
-                                func_name = tc.get("function", {}).get("name", "")
-                                func_args_str = tc.get("function", {}).get("arguments", "{}")
-                            else:
-                                func_name = getattr(tc, "function", None) or ""
-                                func_args_str = "{}"
+        # Record aggregated usage for the agent's internal model calls
+        self._record_agent_usage(result, route.model, filename)
 
-                            if "write_output_file" in func_name:
-                                tool_wrote = True
-                                # Try to extract the code from the tool call args to check validity
-                                try:
-                                    import json
-                                    func_args = json.loads(func_args_str) if isinstance(func_args_str, str) else {}
-                                    written_code = func_args.get("code", "")
-                                    if len(written_code) > 50:  # valid code block
-                                        break
-                                except (json.JSONDecodeError, TypeError):
-                                    pass
+        # Success = the agent wrote at least one file via the write tool
+        if self._agent_wrote_file(result):
+            self.log_info("Verify", f"ReAct fix applied to {filename}")
+            return True
 
-                if tool_wrote:
+        # Fallback 1: extract a fenced code block from the final message
+        messages = result.get("messages", []) or []
+        final_content = ""
+        if messages:
+            final_content = getattr(messages[-1], "content", "") or ""
+        code = _extract_code_block(str(final_content))
+        if code and len(code) >= 50:
+            file_path.write_text(code, encoding="utf-8")
+            self.log_info("Verify", f"ReAct fix applied to {filename} (code block)")
+            return True
+
+        # Fallback 2: single-shot harness fix (cheap last attempt)
+        self.log_warn(
+            "Verify",
+            f"ReAct agent produced no write for {filename}; falling back to single-shot",
+        )
+        return self._fix_file(
+            file_path, errors, filename, file_error_group, cross_file_context,
+        )
+
+    @staticmethod
+    def _agent_wrote_file(result: dict) -> bool:
+        """True if the ReAct agent called write_output_file at least once."""
+        for msg in result.get("messages", []) or []:
+            for tc in getattr(msg, "tool_calls", None) or []:
+                if isinstance(tc, dict) and tc.get("name") == "write_output_file":
                     return True
+            # Older serializations keep tool calls under additional_kwargs
+            ak = getattr(msg, "additional_kwargs", None) or {}
+            for tc in ak.get("tool_calls", []) or []:
+                if (
+                    isinstance(tc, dict)
+                    and tc.get("function", {}).get("name") == "write_output_file"
+                ):
+                    return True
+        return False
 
-                # ---- Fallback: extract code block from final response ----
-                response = result["messages"][-1].content
-                match = re.search(
-                    r"```(?:tsx|typescript|ts|jsx|javascript|js|json)\n(.*?)```",
-                    response,
-                    re.DOTALL,
-                )
-                if match:
-                    code = match.group(1).strip()
-                    if len(code) > 50:  # sanity: actual code, not just "fixed!"
-                        file_path.write_text(code, encoding="utf-8")
-                        self.log_info("Verify", f"Applied code-block fix to {filename}")
-                        return True
-
-                result_text = result["messages"][-1].content[:300] if result["messages"] else ""
-                self.log_warn(
-                    "Verify",
-                    f"Agent did not produce a valid fix for {filename} — "
-                    f"no write_output_file call, no valid code block. Response: {result_text}...",
-                )
-                return False
-            else:
-                return False
-
-        except Exception as e:
-            self.log_warn("Verify", f"Failed to fix {filename}: {e}")
-            return False
-
-    # ---- Legacy auto-fix (kept for StateMachine compatibility) ---------------
-
-    def _auto_fix(self, errors: str) -> int:
-        """Legacy auto-fix (returns count of files fixed).
-
-        Delegates to the enhanced ReAct agent fix system.
-        """
-        return self._auto_fix_with_agent(errors)
+    def _record_agent_usage(self, result: dict, model: str, filename: str):
+        """Best-effort aggregated token accounting for the ReAct agent's calls."""
+        if self.harness is None:
+            return
+        prompt_tokens = 0
+        completion_tokens = 0
+        for msg in result.get("messages", []) or []:
+            um = getattr(msg, "usage_metadata", None) or {}
+            prompt_tokens += int(um.get("input_tokens", 0) or 0)
+            completion_tokens += int(um.get("output_tokens", 0) or 0)
+        if prompt_tokens + completion_tokens > 0:
+            self.harness.record_usage(
+                task_type="verify_fix",
+                model=model,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                category=self._file_category(filename),
+            )
 
     # ---- Standard build steps (used by StateMachine) ------------------------
 
@@ -613,26 +699,12 @@ class VerifyAgent(BaseAgent):
 
         return None
 
-    # ---- Advanced: grouped fix pass (fixes related files together) ----------
+    @staticmethod
+    def _file_category(filename: str) -> str:
+        """Infer the category from a target-relative path (for routing/memos)."""
+        norm = "/" + str(filename).replace("\\", "/") + "/"
+        for cat in ("screens", "widgets", "providers", "services", "models", "utils"):
+            if f"/{cat}/" in norm:
+                return cat
+        return "other"
 
-    def _fix_file_group(
-        self,
-        files: list[str],
-        all_errors: str,
-        cross_file_context: str = "",
-    ) -> int:
-        """Fix a group of related files (e.g., all files with import errors)."""
-        success_count = 0
-        for filename in files:
-            file_path = self._resolve_file(filename)
-            if not file_path:
-                continue
-            fixed = self._fix_with_agent(
-                file_path=file_path,
-                errors=all_errors,
-                filename=filename,
-                cross_file_context=cross_file_context,
-            )
-            if fixed:
-                success_count += 1
-        return success_count

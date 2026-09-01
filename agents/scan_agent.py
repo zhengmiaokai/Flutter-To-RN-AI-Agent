@@ -11,7 +11,7 @@ Three scan modes:
               ambiguous root-level "utils" (balanced cost/accuracy)
 - ``deep``  — AI reclassifies ALL Dart files for maximum accuracy
 
-Files are sent to the LLM in batches (up to 25 per call) so the system prompt
+Files are sent to the LLM in batches (up to 50 per call) so the system prompt
 is amortized across many files. Each file preview is limited to ~20 lines
 (~500-800 chars) to keep token usage low.
 """
@@ -24,7 +24,6 @@ from pathlib import Path
 from rich.console import Console
 
 from framework.config import Config
-from framework.llm import LLMClient
 from tools import scan_source_directory
 from prompts.scanner import BATCH_CLASSIFY_SYSTEM, build_batch_prompt
 
@@ -58,11 +57,12 @@ class ScanAgent:
     def __init__(
         self,
         config: Config,
-        llm: LLMClient | None = None,
+        harness=None,
         scan_mode: str | None = None,
     ):
         self.config = config
-        self.llm = llm
+        self.harness = harness
+        self.llm = harness.llm if harness is not None else None
         self.scan_mode = scan_mode or config.scan_mode
         self.console = Console()
 
@@ -111,7 +111,7 @@ class ScanAgent:
         In ``smart`` mode: only files in "other" + root-level "utils".
         In ``deep`` mode: ALL Dart files across all categories.
 
-        Files are grouped into batches of 25 and sent in a single API call
+        Files are grouped into batches of 50 and sent in a single API call
         per batch. Returns the number of files reclassified.
         """
         candidates: list[Path] = []
@@ -174,12 +174,16 @@ class ScanAgent:
         self._log_dim(f"  →  batch[{len(files)}]", f"{files[0].name} (+{len(files)-1} more)")
 
         try:
-            response = self.llm.chat(
+            if not self.harness:
+                return None
+            result = self.harness.call(
+                task_type="scan_classify",
                 system_prompt=BATCH_CLASSIFY_SYSTEM,
                 user_message=prompt,
                 temperature=0.0,
+                cache=True,
             )
-            raw = response.strip()
+            raw = result.content.strip()
         except Exception as exc:
             self._log_warn("  classify-err", str(exc)[:120])
             return None

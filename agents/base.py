@@ -1,45 +1,49 @@
 """agents/base — Base class for all AI agents in the Flutter-to-RN converter.
 
-Provides shared infrastructure built on LangChain/LangGraph:
-- self.llm         → LLMClient wrapping ChatOpenAI (LangChain powered)
-- self.config      → Application configuration
-- self.create_agent() → Factory for LangGraph ReAct agents
-
-Each subclass defines its system prompt and tool set, then calls
-self.create_agent() to get a compiled LangGraph agent.
+Agents hold the Harness (the single LLM entry point) rather than calling
+an LLM directly.
 """
 
 from rich.console import Console
 
 from framework.config import Config
-from framework.llm import LLMClient
 
 
 class BaseAgent:
     """Base class for all agents in the pipeline.
 
-    Provides LLM client access and a factory method for creating
-    LangGraph ReAct agents.
+    Provides harness access and shared logging helpers.
     """
 
     def __init__(
         self,
         config: Config,
-        llm: LLMClient | None = None,
+        harness=None,
     ):
         self.config = config
-        self.llm = llm
+        self.harness = harness
+        self.llm = harness.llm if harness is not None else None
         self.console = Console()
 
-    # ---- LangGraph agent factory --------------------------------------------
+    # ---- LangGraph ReAct agent factory --------------------------------------
 
-    def create_agent(self, tools: list, system_prompt: str, name: str = "agent"):
-        """Create a LangGraph ReAct agent bound to this agent's LLM.
+    def create_agent(
+        self,
+        tools: list,
+        system_prompt: str,
+        name: str = "agent",
+        model=None,
+        base_url=None,
+        api_key=None,
+    ):
+        """Create a compiled LangGraph ReAct agent bound to this agent's LLM.
 
         Args:
             tools: List of LangChain @tool-decorated functions or BaseTool.
             system_prompt: System prompt for agent behavior.
             name: Agent name (used as graph node identifier).
+            model/base_url/api_key: Optional model connection override
+                (defaults to the global config connection).
 
         Returns:
             Compiled LangGraph agent callable via .invoke({'messages': [...]}).
@@ -50,6 +54,9 @@ class BaseAgent:
             tools=tools,
             system_prompt=system_prompt,
             name=name,
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
         )
 
     # ---- logging ------------------------------------------------------------

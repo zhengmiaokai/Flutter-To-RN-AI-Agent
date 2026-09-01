@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import hashlib
+import re
 import shutil
 from pathlib import Path
 from typing import Any, TypedDict
@@ -25,7 +26,8 @@ from typing import Any, TypedDict
 from rich.console import Console
 
 from framework.config import Config
-from framework.llm import LLMClient
+from framework.harness import BudgetExceededError, Harness
+from framework.memory import MemoryStore
 from framework.state import StateManager
 from framework.state_machine import StateMachine, StepResult, StepStatus
 from agents.scan_agent import ScanAgent
@@ -90,7 +92,8 @@ class Pipeline:
 
     def __init__(self, config: Config):
         self._config = config
-        self._llm = LLMClient(config)
+        self._harness = Harness(config)
+        self._memory = MemoryStore(config.target_dir) if config.memory_enabled else None
         self._state = StateManager(config.state_path)
         self._rag = RAGEngine(config)
         self._graph = self._build_graph()
@@ -170,7 +173,7 @@ class Pipeline:
 
         console.print("[bold]Phase 2: Scan & Classify[/bold]")
 
-        scanner = ScanAgent(self._config, llm=self._llm, scan_mode=self._config.scan_mode)
+        scanner = ScanAgent(self._config, harness=self._harness, scan_mode=self._config.scan_mode)
         groups = scanner.scan()
 
         # Convert Paths to strings for JSON-safe state
@@ -249,8 +252,8 @@ class Pipeline:
             console.print("  [yellow]No convertible source files found.[/yellow]")
             return {"convert_done": True, "converted_count": 0, "failed_count": 0}
 
-        converter = ConvertAgent(self._config, self._llm, self._state)
-        reflector = ReflectAgent(self._config, self._llm)
+        converter = ConvertAgent(self._config, harness=self._harness, state=self._state)
+        reflector = ReflectAgent(self._config, self._harness)
 
         # Build project-wide file registry for context-aware conversion
         from agents.convert_agent import build_file_registry, CATEGORY_MAP
@@ -303,13 +306,24 @@ class Pipeline:
 
         console.print(f"  [dim]Converted: {stats['success']} success, {stats['failed']} failed[/dim]")
 
-        # Reflection: quality check on all screens and widgets
+        # Project digest (memory type ④): converted modules + key signatures.
+        # Built once per run so convert tasks can reference the project shape
+        # instead of paying for verbose RAG blocks.
+        if self._memory is not None:
+            self._memory.set_project_digest(_build_project_digest(registry, self._config.target_dir))
+
+        # Reflection: quality check on all screens and widgets (batched, with
+        # score-memory skip + few-shot/fix-memo writes).
         sample_items = [
             (cat, f) for cat, f in work_items
             if cat in ("screens", "widgets")
         ]
-        for category, src_path in sample_items:
-            _reflect_one_file(self._config, converter, reflector, category, src_path, self._state)
+        if sample_items:
+            source_root = Path(self._config.source_dir)
+            _run_reflection(
+                self._config, converter, reflector, sample_items,
+                self._state, self._memory, registry, source_root,
+            )
 
         # Index converted TS files for VerifyAgent's RAG type retrieval
         if self._rag.is_indexed:
@@ -346,9 +360,11 @@ class Pipeline:
         # true" alongside "fixed: false" files from a prior failed attempt).
         self._state.clear_phase_files("verify")
 
-        verifier = VerifyAgent(self._config, self._llm)
+        verifier = VerifyAgent(self._config, harness=self._harness)
         if self._rag.is_indexed:
             verifier.set_rag_engine(self._rag)
+        if self._memory is not None:
+            verifier.set_memory_store(self._memory)
 
         attempt = state.get("verify_attempts", 0)
 
@@ -365,15 +381,29 @@ class Pipeline:
 
         # Build the LangGraph StateMachine for the fix loop
         sm = StateMachine("verify-loop")
-        sm.add_step("install", lambda _: _npm_install(verifier))
-        sm.add_step("build", lambda data: _tsc_build(verifier, data))
+        # The graph loop already provides retry semantics, so intra-node
+        # retries are wasteful (tsc/LLM failures are deterministic given the
+        # same files): npm install gets one retry (transient network), build
+        # and fix run once per cycle.
+        sm.add_step("install", lambda _: _npm_install(verifier), retry_count=1)
+        sm.add_step("build", lambda data: _tsc_build(verifier, data), retry_count=0)
         sm.add_conditional(
             "check",
             lambda data: data.get("build_ok", False) if data else False,
             on_success="done",
             on_failure="fix",
         )
-        sm.add_step("fix", lambda data: _auto_fix(verifier, data), next_step="build", retry_count=3)
+        # fix runs the fix engine once (no intra-node retries — the graph
+        # loop already re-invokes it); fix_router short-circuits to END as
+        # soon as the fix engine reports gave_up, so unfixable errors don't
+        # churn through build→check→fix again.
+        sm.add_step("fix", lambda data: _auto_fix(verifier, data), retry_count=0)
+        sm.add_conditional(
+            "fix_router",
+            lambda data: not (data.get("gave_up", False) if data else False),
+            on_success="build",
+            on_failure="done",
+        )
 
         sm.hook("before_step", lambda name, data: console.print(f"  [dim]StateGraph → {name}[/dim]"))
         sm.hook("on_error", lambda name, err: console.print(f"  [yellow]Step '{name}' error: {err}[/yellow]"))
@@ -453,6 +483,13 @@ class Pipeline:
         console.print(f"  Source: {self._config.source_dir}")
         console.print(f"  Target: {self._config.target_dir}")
         console.print(f"  Model:  {self._config.model}")
+        for task, entry in self._config.model_routes.items():
+            model = entry.get("model") or self._config.model
+            fallback = entry.get("fallback_model")
+            label = f"  Route:  {task} → {model}"
+            if fallback:
+                label += f" (fallback: {fallback})"
+            console.print(label)
 
         compiled = self._graph.compile()
 
@@ -509,6 +546,16 @@ class Pipeline:
             console.print("\n[bold green]Conversion complete![/bold green]")
         else:
             console.print("\n[bold yellow]Conversion complete with issues. Review output manually.[/bold yellow]")
+
+        # ── Token ledger report ─────────────────────────────────────────────
+        report = self._harness.report()
+        if report:
+            console.print("\n[bold]Token ledger (session + prior runs):[/bold]")
+            for task, t in sorted(report.items()):
+                console.print(
+                    f"  {task:<14s} calls={t['calls']:>3d} cache_hits={t['cache_hits']:>3d} "
+                    f"in={t['prompt']:>8d} out={t['completion']:>7d}"
+                )
 
         return True
 
@@ -612,51 +659,135 @@ def _build_reflection_feedback(result) -> str:
     return "\n".join(lines)
 
 
-def _reflect_one_file(
+def _reflect_output_path(cfg: Config, category: str, src_path: Path) -> Path | None:
+    """Output path for a reflect-reviewed file (screens/widgets only)."""
+    if category == "screens":
+        return Path(cfg.target_dir) / "src" / "screens" / f"{src_path.stem}.tsx"
+    if category == "widgets":
+        return Path(cfg.target_dir) / "src" / "components" / f"{src_path.stem}.tsx"
+    return None
+
+
+def _compute_deps_hash(original: str, src_name: str, registry, name_map: dict) -> str:
+    """Hash the file plus its companion source contents.
+
+    Score-memory skip (memory type ③) only applies when BOTH the file and
+    its dependencies are unchanged — otherwise a modified model file would
+    mask a regression in a screen that depends on it.
+    """
+    from agents.convert_agent import find_companion_context
+    h = hashlib.md5()
+    h.update(original.encode("utf-8"))
+    companions = find_companion_context(src_name, registry, source_code=original)
+    for c in companions:
+        p = name_map.get(c["name"])
+        if p is not None:
+            try:
+                h.update(f"{c['name']}|{p.read_text(encoding='utf-8')}".encode("utf-8"))
+                continue
+            except Exception:
+                pass
+        h.update(c["name"].encode("utf-8"))
+    return h.hexdigest()
+
+
+def _run_reflection(
     cfg: Config,
     converter: ConvertAgent,
     reflector: ReflectAgent,
+    sample_items: list[tuple[str, Path]],
+    state_mgr: StateManager | None,
+    memory: MemoryStore | None,
+    registry,
+    source_root: Path,
+):
+    """Batch review screens/widgets with score-memory skip and rework.
+
+    Initial review is batched (amortizes the reflect system prompt across
+    files); re-conversion stays per-file since it needs immediate results
+    for the revert/score-guard decision.
+    """
+    name_map: dict[str, Path] = {}
+    if source_root.exists():
+        for p in source_root.rglob("*.dart"):
+            name_map[p.name] = p
+
+    to_review: list[tuple] = []
+    for category, src_path in sample_items:
+        output_path = _reflect_output_path(cfg, category, src_path)
+        if output_path is None or not output_path.exists():
+            continue
+        file_key = f"{category}:{src_path.name}"
+        # Skip if already reviewed in a previous run (checkpoint)
+        if state_mgr:
+            existing = state_mgr.get_file_state("reflect", file_key)
+            if existing.get("status") in ("reviewed", "reconverted"):
+                continue
+        try:
+            original = src_path.read_text(encoding="utf-8")
+            converted = output_path.read_text(encoding="utf-8")
+        except Exception:
+            continue
+
+        source_hash = hashlib.md5(original.encode("utf-8")).hexdigest()
+        deps_hash = _compute_deps_hash(original, src_path.name, registry, name_map)
+        if memory is not None and memory.should_skip_reflect(source_hash, deps_hash):
+            console.print(f"  [dim][Reflect][/dim] {src_path.name} unchanged (score-memory skip)")
+            continue
+        to_review.append((category, src_path, original, converted, file_key, source_hash, deps_hash))
+
+    if not to_review:
+        return
+
+    batch_items = [
+        (key, converted, original, src_path.name)
+        for (_c, src_path, original, converted, key, _h, _d) in to_review
+    ]
+    results = reflector.reflect_batch(batch_items)
+
+    for (category, src_path, original, converted, file_key, source_hash, deps_hash) in to_review:
+        result = results.get(file_key)
+        if result is None:
+            continue
+        _handle_reflect_result(
+            cfg, converter, reflector, state_mgr, memory, category, src_path,
+            original, converted, file_key, result, source_hash, deps_hash,
+        )
+
+
+def _record_memory_pass(
+    memory: MemoryStore | None,
+    category: str,
+    original: str,
+    converted: str,
+    score: int,
+    source_hash: str,
+    deps_hash: str,
+):
+    if memory is None:
+        return
+    memory.record_score_memory(source_hash, score, True, deps_hash)
+    if score >= 90 and original.strip() and converted.strip():
+        memory.record_few_shot(category, original, converted, score)
+
+
+def _handle_reflect_result(
+    cfg: Config,
+    converter: ConvertAgent,
+    reflector: ReflectAgent,
+    state_mgr: StateManager | None,
+    memory: MemoryStore | None,
     category: str,
     src_path: Path,
-    state_mgr: StateManager | None = None,
+    original: str,
+    converted: str,
+    file_key: str,
+    result,
+    source_hash: str,
+    deps_hash: str,
 ):
-    """Run quality reflection on a single converted file.
-
-    If quality is below threshold, triggers re-conversion and re-verifies
-    the result. Tracks re-conversion attempts and persistence quality
-    scores per-file via state manager.
-    """
-    if category == "screens":
-        output_path = Path(cfg.target_dir) / "src" / "screens" / f"{src_path.stem}.tsx"
-    elif category == "widgets":
-        output_path = Path(cfg.target_dir) / "src" / "components" / f"{src_path.stem}.tsx"
-    else:
-        return
-
-    if not output_path.exists():
-        return
-
-    file_key = f"{category}:{src_path.name}"
-
-    # Skip reflection if already done (checkpoint via structured state)
-    if state_mgr:
-        existing = state_mgr.get_file_state("reflect", file_key)
-        if existing.get("status") in ("reviewed", "reconverted"):
-            return
-
-    try:
-        original = src_path.read_text(encoding="utf-8")
-        converted = output_path.read_text(encoding="utf-8")
-    except Exception:
-        return
-
-    result = reflector.reflect(
-        rn_code=converted,
-        flutter_source=original,
-        filename=src_path.name,
-    )
-
-    # Common reflect state
+    """Record/process one reflection result; triggers rework when needed."""
+    output_path = _reflect_output_path(cfg, category, src_path)
     reflect_state = {
         "score": result.score,
         "pass": result.pass_,
@@ -666,68 +797,143 @@ def _reflect_one_file(
         "needs_rework": result.needs_rework(),
     }
 
-    if result.needs_rework():
-        # Log top issues for debugging
-        issue_summary = "; ".join(
-            f"[{i.get('severity','?')}] {i.get('description','')[:80]}"
-            for i in result.issues[:3]
-        )
-        console.print(f"  [yellow][Reflect][/yellow] {src_path.name} score={result.score} — re-converting")
-        if issue_summary:
-            console.print(f"         Issues: {issue_summary}")
-
-        # Build targeted feedback from reflection issues so the LLM knows
-        # exactly what to fix instead of re-generating the same flawed output
-        reflection_feedback = _build_reflection_feedback(result)
-
-        # Backup original converted output before re-conversion, so we can
-        # roll back if the new version scores worse than the original.
-        backup_content = converted
-
-        reflect_state["status"] = "reconverted"
-        reflect_state["reconverted"] = True
-        try:
-            converter.convert_file(category, src_path, reflection_feedback=reflection_feedback)
-
-            # Re-reflect to verify the fix
-            try:
-                new_converted = output_path.read_text(encoding="utf-8")
-                new_result = reflector.reflect(
-                    rn_code=new_converted,
-                    flutter_source=original,
-                    filename=src_path.name,
-                )
-
-                # Score guard: revert if re-conversion produced worse output
-                if new_result.score < result.score:
-                    console.print(f"  [yellow][Reflect][/yellow] {src_path.name} re-conversion score ({new_result.score}) dropped from original ({result.score}), reverting.")
-                    output_path.write_text(backup_content, encoding="utf-8")
-                    # Use the original reflect state — the revert is labelled
-                    # "reconverted" so it won't be re-processed next run, but
-                    # the actual converted content is the original.
-                    reflect_state["reverted"] = True
-                else:
-                    if new_result.needs_rework():
-                        console.print(f"  [yellow][Reflect][/yellow] {src_path.name} still below threshold (score={new_result.score}), accepting.")
-                    else:
-                        console.print(f"  [dim][Reflect][/dim] {src_path.name} score={new_result.score} OK after re-conversion")
-                    # Update state with post-reconversion values
-                    reflect_state["post_reconversion_score"] = new_result.score
-                    reflect_state["post_reconversion_pass"] = new_result.pass_
-                    reflect_state["post_reconversion_issues"] = new_result.issues
-            except Exception as exc:
-                console.print(f"  [yellow][Reflect][/yellow] Re-reflection failed for {src_path.name}: {exc}")
-        except Exception as exc:
-            console.print(f"  [yellow][Reflect][/yellow] Re-conversion failed for {src_path.name}: {exc}")
-
-        if state_mgr:
-            state_mgr.set_file_state("reflect", file_key, reflect_state)
-    else:
+    if not result.needs_rework():
         console.print(f"  [dim][Reflect][/dim] {src_path.name} score={result.score} OK")
         reflect_state["status"] = "reviewed"
         reflect_state["reconverted"] = False
         if state_mgr:
             state_mgr.set_file_state("reflect", file_key, reflect_state)
+        _record_memory_pass(memory, category, original, converted, result.score, source_hash, deps_hash)
+        return
+
+    # ── rework path ───────────────────────────────────────────────────────
+    issue_summary = "; ".join(
+        f"[{i.get('severity','?')}] {i.get('description','')[:80]}"
+        for i in result.issues[:3]
+    )
+    console.print(f"  [yellow][Reflect][/yellow] {src_path.name} score={result.score} — re-converting")
+    if issue_summary:
+        console.print(f"         Issues: {issue_summary}")
+
+    reflection_feedback = _build_reflection_feedback(result)
+    backup_content = converted
+    reflect_state["status"] = "reconverted"
+    reflect_state["reconverted"] = True
+
+    final_score = result.score
+    final_pass = result.pass_
+    final_content = converted
+    try:
+        converter.convert_file(category, src_path, reflection_feedback=reflection_feedback)
+        try:
+            new_converted = output_path.read_text(encoding="utf-8")
+            new_result = reflector.reflect(
+                rn_code=new_converted,
+                flutter_source=original,
+                filename=src_path.name,
+            )
+
+            # Score guard: revert if re-conversion produced worse output
+            if new_result.score < result.score:
+                console.print(f"  [yellow][Reflect][/yellow] {src_path.name} re-conversion score ({new_result.score}) dropped from original ({result.score}), reverting.")
+                output_path.write_text(backup_content, encoding="utf-8")
+                reflect_state["reverted"] = True
+            else:
+                if new_result.needs_rework():
+                    console.print(f"  [yellow][Reflect][/yellow] {src_path.name} still below threshold (score={new_result.score}), accepting.")
+                else:
+                    console.print(f"  [dim][Reflect][/dim] {src_path.name} score={new_result.score} OK after re-conversion")
+                reflect_state["post_reconversion_score"] = new_result.score
+                reflect_state["post_reconversion_pass"] = new_result.pass_
+                reflect_state["post_reconversion_issues"] = new_result.issues
+                final_score = new_result.score
+                final_pass = new_result.pass_
+                final_content = new_converted
+        except Exception as exc:
+            console.print(f"  [yellow][Reflect][/yellow] Re-reflection failed for {src_path.name}: {exc}")
+    except Exception as exc:
+        console.print(f"  [yellow][Reflect][/yellow] Re-conversion failed for {src_path.name}: {exc}")
+
+    if state_mgr:
+        state_mgr.set_file_state("reflect", file_key, reflect_state)
+
+    if memory is not None:
+        memory.record_score_memory(source_hash, final_score, final_pass, deps_hash)
+        if final_score >= 90 and original.strip() and final_content.strip():
+            memory.record_few_shot(category, original, final_content, final_score)
+
+
+def _extract_export_signatures(path: Path) -> str:
+    """First few export/interface/type lines of a converted file (for digest)."""
+    if not path.exists():
+        return ""
+    try:
+        content = path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+    sigs = []
+    for line in content.splitlines():
+        s = line.strip()
+        if any(s.startswith(k) for k in ("export ", "export default", "interface ", "type ")):
+            sigs.append(s)
+        if len(sigs) >= 3:
+            break
+    return ("  [exports: " + "; ".join(sigs) + "]") if sigs else ""
+
+
+def _build_project_digest(registry, target_dir: str) -> str:
+    """Build the project digest (memory type ④) from the file registry."""
+    lines = [
+        "## Project structure (already converted modules — import these instead of redefining):"
+    ]
+    count = 0
+    for name, info in sorted(registry.items()):
+        if count >= 60:
+            break
+        out = info.get("output", "")
+        lines.append(
+            f"- {name} → {info.get('category', 'other')} "
+            f"({out}){_extract_export_signatures(Path(out))}"
+        )
+        count += 1
+    return "\n".join(lines)
+
+
+def _record_fix_memos(verifier: VerifyAgent):
+    """Record fix memos (memory type ②) after a successful auto-fix cycle."""
+    memory = getattr(verifier, "_memory", None)
+    if memory is None or not verifier.last_fix_results:
+        return
+    for filename, file_data in verifier.last_fix_results.items():
+        if not file_data.get("fixed"):
+            continue
+        codes = file_data.get("error_codes") or []
+        fp = file_data.get("file_path")
+        if not codes or not fp or not Path(fp).exists():
+            continue
+        try:
+            fixed_content = Path(fp).read_text(encoding="utf-8")
+        except Exception:
+            continue
+        category = verifier._file_category(filename)
+        for code in codes:
+            memory.record_fix_memo(code, category, error_message=code, fix_snippet=fixed_content)
+
+
+_TSC_ERROR_SIG_RE = re.compile(
+    r"^(?:> )?(.+?)\(\d+,\d+\):?\s+error\s+(TS\d+):", re.MULTILINE
+)
+
+
+def _error_signature(errors: str) -> frozenset[str]:
+    """Signature of a tsc error set: (file, error-code) pairs.
+
+    Used to detect whether an auto-fix cycle made any progress — an identical
+    signature across cycles means the same errors persist.
+    """
+    return frozenset(
+        f"{m.group(1)}|{m.group(2)}" for m in _TSC_ERROR_SIG_RE.finditer(errors or "")
+    )
 
 
 def _npm_install(verifier: VerifyAgent) -> StepResult:
@@ -775,6 +981,19 @@ def _auto_fix(verifier: VerifyAgent, data: dict | None) -> StepResult:
         console.print(f"[yellow]Auto-fix: reached max cycles, build still has errors.[/yellow]")
         return StepResult(status=StepStatus.FAILED, data={**data, "build_ok": False, "gave_up": True}, error="Max auto-fix retries reached")
 
+    # No-progress detection: if the error set is identical to the previous
+    # fix cycle, the fix engine made no headway — stop instead of re-invoking
+    # the LLM on the same errors.
+    sig = _error_signature(errors)
+    if attempt > 1 and sig and data.get("_prev_error_sig") == sig:
+        console.print("[yellow]Auto-fix: same errors persist after fix, stopping (no progress).[/yellow]")
+        return StepResult(
+            status=StepStatus.FAILED,
+            data={**data, "build_ok": False, "gave_up": True},
+            error="No progress across fix cycles",
+        )
+    data = {**data, "_prev_error_sig": sig}
+
     try:
         # Reset and run fix — last_fix_results will be populated by the agent
         verifier.last_fix_results = {}
@@ -782,8 +1001,19 @@ def _auto_fix(verifier: VerifyAgent, data: dict | None) -> StepResult:
         # Attach per-file fix results to returned data
         data["fix_results"] = dict(verifier.last_fix_results) if verifier.last_fix_results else {}
         if fixed_count > 0:
+            # Persist fix memos for future runs (memory type ②)
+            _record_fix_memos(verifier)
             return StepResult(status=StepStatus.SUCCESS, data=data)
         console.print("[yellow]Auto-fix unable to resolve remaining errors.[/yellow]")
         return StepResult(status=StepStatus.FAILED, data={**data, "build_ok": False, "gave_up": True}, error="No files could be fixed")
+    except BudgetExceededError as e:
+        # Budget exhausted mid-cycle (e.g. a ReAct loop burned it) — stop the
+        # verify phase instead of looping build/check/fix without tokens.
+        console.print(f"[yellow]Auto-fix: {e}[/yellow]")
+        return StepResult(
+            status=StepStatus.FAILED,
+            error=str(e),
+            data={**data, "build_ok": False, "gave_up": True},
+        )
     except Exception as e:
         return StepResult(status=StepStatus.FAILED, error=str(e), data=data)

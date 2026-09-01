@@ -7,7 +7,149 @@ converted React Native project.
 import re
 
 # =============================================================================
-# Build fix system prompt
+# Error categorization helpers
+# =============================================================================
+
+# Maps tsc error codes to fix categories
+ERROR_CATEGORIES: dict[str, str] = {
+    "TS2307": "import",
+    "TS2792": "import",
+    "TS2304": "declaration",
+    "TS2339": "declaration",
+    "TS2552": "declaration",
+    "TS2322": "type",
+    "TS2345": "type",
+    "TS2769": "type",
+    "TS2554": "type",
+    "TS2571": "type",
+    "TS18046": "type",
+    "TS7053": "type",
+    "TS2365": "type",
+    "TS2353": "type",
+    "TS2416": "type",
+    "TS2540": "type",
+    "TS2322": "type",
+    "TS2722": "type",
+    "TS6133": "unused",
+    "TS6196": "unused",
+    "TS6192": "unused",
+    "TS2694": "declaration",
+    "TS2445": "declaration",
+    "TS2375": "syntax",
+    "TS1005": "syntax",
+    "TS1109": "syntax",
+    "TS1128": "syntax",
+    "TS17012": "syntax",
+}
+
+
+def categorize_errors(tsc_output: str) -> dict[str, list[str]]:
+    """Parse tsc output into categorized error messages."""
+    categories: dict[str, list[str]] = {
+        "import": [],
+        "declaration": [],
+        "type": [],
+        "syntax": [],
+        "unused": [],
+        "other": [],
+    }
+
+    for line in tsc_output.split("\n"):
+        line_stripped = line.strip()
+        if not line_stripped:
+            continue
+
+        # Match tsc error format: file(line,col): error TSXXXX: msg
+        # or: file:line:col - error TSXXXX: msg
+        match = re.search(r"error\s+(TS\d+):", line_stripped)
+        if match:
+            code = match.group(1)
+            cat = ERROR_CATEGORIES.get(code, "other")
+            categories[cat].append(line_stripped)
+        elif "error" in line_stripped.lower():
+            categories["other"].append(line_stripped)
+
+    # Remove empty categories
+    return {k: v for k, v in categories.items() if v}
+
+
+# =============================================================================
+# Hybrid single-shot fix system prompt (default VerifyAgent path)
+# =============================================================================
+
+HYBRID_FIX_SYSTEM = """You are an expert React Native TypeScript developer fixing a TypeScript build failure.
+
+You are given the erroring file and structured errors. Return the COMPLETE corrected file.
+
+## Rules
+1. Fix ALL listed errors — not just the first one
+2. Do NOT change business logic — only fix compilation errors
+3. Do NOT add `// @ts-ignore` or `// @ts-nocheck` — fix the actual error
+4. Do NOT remove code that compiles correctly — only modify lines with errors
+5. If a package import is missing, ADD the import rather than removing usage
+6. Fix relative import paths for companion files
+7. Replace `any` with proper types where the error requires it
+
+## Output format
+Return the COMPLETE corrected file in a single ```tsx or ```typescript code block.
+No explanations, no markdown outside the code block."""
+
+
+def get_hybrid_fix_prompt(
+    source_code: str,
+    errors: str,
+    filename: str,
+    cross_file_context: str = "",
+) -> str:
+    """Build a single-shot fix prompt: structured errors + current code.
+
+    Instructs the model to return the whole corrected file as a code block
+    (no tool calling), compatible with reasoning-type models.
+    """
+    categorized = categorize_errors(errors)
+    priority_order = ["import", "declaration", "type", "syntax", "unused", "other"]
+    error_sections = []
+    for cat in priority_order:
+        if cat in categorized:
+            label = {
+                "import": "IMPORT ERRORS (fix these first)",
+                "declaration": "DECLARATION ERRORS (missing types/names)",
+                "type": "TYPE MISMATCH ERRORS",
+                "syntax": "SYNTAX ERRORS",
+                "unused": "UNUSED (can be removed, lowest priority)",
+                "other": "OTHER ERRORS",
+            }.get(cat, cat.upper())
+
+            for err in categorized[cat]:
+                error_sections.append(f"  [{label}] {err}")
+
+    categorized_block = "\n".join(error_sections) if error_sections else errors
+
+    prompt = f"""Fix the following React Native TypeScript file that has build errors.
+
+File: {filename}
+
+## Categorized Errors
+```
+{categorized_block}
+```
+
+## Current Code
+```typescript
+{source_code}
+```
+
+Return the COMPLETE corrected file in a single ```tsx code block."""
+    if cross_file_context:
+        prompt += (
+            f"\n\n## Companion File Context (exports from imported files)\n"
+            f"{cross_file_context}"
+        )
+    return prompt
+
+
+# =============================================================================
+# ReAct self-verifying fix loop (VerifyAgent._fix_with_agent)
 # =============================================================================
 
 BUILD_FIX_SYSTEM = """You are an expert React Native TypeScript developer debugging a TypeScript build failure.
@@ -77,83 +219,13 @@ Missing brackets, semicolons, or closing JSX tags
 """
 
 
-# =============================================================================
-# Error categorization helpers
-# =============================================================================
-
-# Maps tsc error codes to fix categories
-ERROR_CATEGORIES: dict[str, str] = {
-    "TS2307": "import",
-    "TS2792": "import",
-    "TS2304": "declaration",
-    "TS2339": "declaration",
-    "TS2552": "declaration",
-    "TS2322": "type",
-    "TS2345": "type",
-    "TS2769": "type",
-    "TS2554": "type",
-    "TS2571": "type",
-    "TS18046": "type",
-    "TS7053": "type",
-    "TS2365": "type",
-    "TS2353": "type",
-    "TS2416": "type",
-    "TS2540": "type",
-    "TS2322": "type",
-    "TS2722": "type",
-    "TS6133": "unused",
-    "TS6196": "unused",
-    "TS6192": "unused",
-    "TS2694": "declaration",
-    "TS2445": "declaration",
-    "TS2375": "syntax",
-    "TS1005": "syntax",
-    "TS1109": "syntax",
-    "TS1128": "syntax",
-    "TS17012": "syntax",
-}
-
-
-def categorize_errors(tsc_output: str) -> dict[str, list[str]]:
-    """Parse tsc output into categorized error messages."""
-    categories: dict[str, list[str]] = {
-        "import": [],
-        "declaration": [],
-        "type": [],
-        "syntax": [],
-        "unused": [],
-        "other": [],
-    }
-
-    for line in tsc_output.split("\n"):
-        line_stripped = line.strip()
-        if not line_stripped:
-            continue
-
-        # Match tsc error format: file(line,col): error TSXXXX: msg
-        # or: file:line:col - error TSXXXX: msg
-        match = re.search(r"error\s+(TS\d+):", line_stripped)
-        if match:
-            code = match.group(1)
-            cat = ERROR_CATEGORIES.get(code, "other")
-            categories[cat].append(line_stripped)
-        elif "error" in line_stripped.lower():
-            categories["other"].append(line_stripped)
-
-    # Remove empty categories
-    return {k: v for k, v in categories.items() if v}
-
-
-# =============================================================================
-# Prompt builder
-# =============================================================================
-
-
 def get_fix_prompt(source_code: str, errors: str, filename: str) -> str:
-    """Build a categorized fix prompt for a single TypeScript file."""
+    """Build a ReAct self-verifying fix prompt for a single TypeScript file.
+
+    Instructs the model to read → write → run_tsc_check → iterate until BUILD_OK.
+    """
     categorized = categorize_errors(errors)
 
-    # Add priority annotation so the LLM knows what to fix first
     priority_order = ["import", "declaration", "type", "syntax", "unused", "other"]
     error_sections = []
     for cat in priority_order:

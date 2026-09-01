@@ -23,13 +23,28 @@ import re
 from pathlib import Path
 
 from framework.config import Config
-from framework.llm import LLMClient
 from framework.state import StateManager
 from agents.base import BaseAgent
 from prompts import build_category_system_prompt, get_conversion_prompt
 
 # Registry: dart filename → output info
 FileRegistry = dict[str, dict[str, str]]
+
+# Categories that benefit from RAG semantic context (stateful/navigation-heavy).
+# Simple categories (models/services/utils) use companion context only — saves
+# embedding + retrieval + input tokens.
+_RAG_CATEGORIES = {"screens", "widgets", "providers"}
+
+_CODE_BLOCK_RE = re.compile(
+    r"```(?:tsx|typescript|ts|jsx|javascript|js)\n(.*?)```",
+    re.DOTALL,
+)
+
+
+def _extract_code_block(text: str) -> str | None:
+    """Extract the first fenced code block from an LLM response."""
+    m = _CODE_BLOCK_RE.search(text or "")
+    return m.group(1).strip() if m else None
 
 
 def _contains_jsx(code: str) -> bool:
@@ -188,8 +203,8 @@ class ConvertAgent(BaseAgent):
     converted code in a ```tsx/ts code block which we extract and write.
     """
 
-    def __init__(self, config: Config, llm: LLMClient, state: StateManager):
-        super().__init__(config, llm)
+    def __init__(self, config: Config, harness=None, state: StateManager | None = None):
+        super().__init__(config, harness)
         self._state = state
         self._file_registry: FileRegistry = {}
         self._rag_engine: "RAGEngine | None" = None  # noqa: F821
@@ -224,21 +239,21 @@ class ConvertAgent(BaseAgent):
         subdir, ext = mapping
         self._convert_single_shot(src_path, category, subdir, ext, reflection_feedback)
 
-    # ---- Single-shot conversion (replaces ReAct agent) --------------------
+    # ---- Single-shot conversion ------------------------------------------
 
     def _convert_single_shot(self, src_path: Path, category: str, subdir: str, ext: str,
                               reflection_feedback: str | None = None):
-        """Convert a file in a single LLM call (replaces ReAct agent loop).
+        """Convert a file in a single LLM call.
 
-        Why single-shot instead of ReAct agent:
-        - We already read the source code before the call — the read_source_file
-          tool is redundant and adds an extra LLM turn.
+        Why single-shot instead of a tool loop:
+        - We already read the source code before the call — a read tool would
+          be redundant and add an extra LLM turn.
         - Writing output is a local file operation — it doesn't need a tool call.
         - A single call eliminates the ~2x system prompt overhead and cuts
           latency by ~40-60%.
 
         The per-category system prompt (~1K-3.5K tokens depending on category)
-        replaces the full 4K-token prompt used previously.
+        keeps the context tight for each conversion.
 
         Args:
             src_path: Path to source .dart file.
@@ -259,9 +274,10 @@ class ConvertAgent(BaseAgent):
             if companions:
                 companion_context = build_context_prompt(companions)
 
-        # RAG-enhanced context (semantic retrieval — supplements companion context)
+        # RAG-enhanced context (semantic retrieval — supplements companion context).
+        # Category-gated: only screens/widgets/providers pay the embedding cost.
         rag_context = ""
-        if self._rag_engine is not None:
+        if self._rag_engine is not None and category in _RAG_CATEGORIES:
             results = self._rag_engine.retrieve_context(
                 query_code=source_code,
                 filename=src_path.name,
@@ -309,20 +325,38 @@ class ConvertAgent(BaseAgent):
             "No explanations, no markdown outside the code block."
         )
 
-        # Single LLM call — no ReAct agent overhead
-        response = self.llm.chat(
+        if not self.harness:
+            raise RuntimeError("ConvertAgent requires a harness.")
+
+        # Single LLM call — no ReAct agent overhead. cache=True dedupes
+        # re-conversion of unchanged inputs; cache_validator only stores
+        # responses that actually contain a code block.
+        result = self.harness.call(
+            task_type="convert",
             system_prompt=system_prompt,
             user_message=user_content,
+            category=category,
+            temperature=0.2,
+            cache=True,
+            cache_validator=_extract_code_block,
         )
+        response = result.content
 
-        # Extract code block and write directly
-        match = re.search(
-            r"```(?:tsx|typescript|ts|jsx|javascript|js)\n(.*?)```",
-            response,
-            re.DOTALL,
-        )
-        if match:
-            code = match.group(1).strip()
+        code = _extract_code_block(response)
+        # Parse-failure retry: once, cache off + slight temperature bump.
+        if code is None:
+            self.log_warn("Convert", f"No code block from LLM for {src_path.name}, retrying once")
+            result = self.harness.call(
+                task_type="convert",
+                system_prompt=system_prompt,
+                user_message=user_content,
+                category=category,
+                temperature=0.4,
+                cache=False,
+            )
+            code = _extract_code_block(result.content)
+
+        if code:
             output_path.parent.mkdir(parents=True, exist_ok=True)
             # Auto-upgrade .ts → .tsx if the output contains JSX but has the wrong extension.
             # TypeScript can't parse <Foo /> inside a .ts file (it sees comparison operators).

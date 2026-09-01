@@ -14,8 +14,8 @@ from prompts.convert import (
     get_conversion_prompt,
 )
 from prompts.verify import (
-    BUILD_FIX_SYSTEM,
-    get_fix_prompt,
+    HYBRID_FIX_SYSTEM,
+    get_hybrid_fix_prompt,
 )
 from prompts.scanner import (
     BATCH_CLASSIFY_SYSTEM,
@@ -26,9 +26,9 @@ __all__ = [
     "FLUTTER_TO_RN_SYSTEM",
     "FLUTTER_TO_RN_CORE",
     "build_category_system_prompt",
-    "BUILD_FIX_SYSTEM",
+    "HYBRID_FIX_SYSTEM",
     "BATCH_CLASSIFY_SYSTEM",
     "get_conversion_prompt",
-    "get_fix_prompt",
+    "get_hybrid_fix_prompt",
     "build_batch_prompt",
 ]

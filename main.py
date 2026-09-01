@@ -1,9 +1,8 @@
 """main — CLI entry point for the Flutter-to-RN converter.
 
 Powered by LangChain + LangGraph:
-- Agent creation:       create_react_agent for each pipeline role
-- Tool reuse:           @tool-decorated functions in tools/__init__.py
 - OpenAI integration:   ChatOpenAI (supports any OpenAI-compatible API)
+- Utility tools:        @tool-decorated functions in tools/__init__.py
 - State persistence:    JSON-file-backed checkpoint/resume
 - Workflow state:       StateGraph with typed state + conditional edges
 - Multi-agent:          4 agents as graph nodes sharing a PipelineState
@@ -51,12 +50,21 @@ def main():
     parser.add_argument("--skip-conversion", action="store_true", help="Skip code conversion phase")
     parser.add_argument("--skip-verification", action="store_true", help="Skip build verification phase")
 
+    # ── Harness: caching, memory, budget, verify mode ──
+    parser.add_argument("--no-memory", action="store_true", help="Disable cross-run memory (few-shots/fix-memos/digest)")
+    parser.add_argument("--cache-ttl", type=int, default=None, help="Response cache TTL in hours")
+    parser.add_argument("--budget", type=int, default=None, help="Hard token budget (0 = unlimited)")
+    parser.add_argument("--route", action="append", default=None, metavar="TASK=MODEL",
+                        help="Route a task to a model (repeatable, e.g. --route convert=claude-sonnet-5). "
+                             "Overrides the primary model only; base_url/api_key inherit the task's "
+                             "MODEL_ROUTES entry or the global config.")
+
     args = parser.parse_args()
 
     from framework.config import init_config
     from orchestration.pipeline import Pipeline
 
-    config = init_config(
+    config_kwargs = dict(
         source_dir=args.source,
         target_dir=args.target,
         model=args.model,
@@ -68,7 +76,23 @@ def main():
         skip_setup=args.skip_setup,
         skip_conversion=args.skip_conversion,
         skip_verification=args.skip_verification,
+        memory_enabled=not args.no_memory,
     )
+    if args.route:
+        routes = {}
+        for spec in args.route:
+            if "=" in spec:
+                task, model = spec.split("=", 1)
+                routes[task.strip()] = {"model": model.strip()}
+        if routes:
+            config_kwargs["model_routes"] = routes
+    # Optional ints: only pass when set so dataclass defaults survive.
+    if args.cache_ttl is not None:
+        config_kwargs["cache_ttl_hours"] = args.cache_ttl
+    if args.budget is not None:
+        config_kwargs["token_budget"] = args.budget
+
+    config = init_config(**config_kwargs)
 
     pipeline = Pipeline(config)
     success = pipeline.run()

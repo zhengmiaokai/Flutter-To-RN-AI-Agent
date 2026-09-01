@@ -1,17 +1,27 @@
-"""tests/test_convert_agent — Tests for the ConvertAgent (LangGraph ReAct-powered).
+"""tests/test_convert_agent — Tests for the ConvertAgent category dispatch.
 
 Tests that the agent correctly dispatches files by category to the
-correct output directories using LangGraph ReAct pattern.
+correct output directories using the single-shot harness path.
 """
 
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
 
 from framework.config import Config
-from framework.llm import LLMClient
 from agents.convert_agent import ConvertAgent
+
+
+class FakeHarness:
+    """Minimal harness stand-in: call() returns a fixed code block."""
+
+    def __init__(self, content: str):
+        self._content = content
+        self.llm = None
+
+    def call(self, **kwargs):
+        from types import SimpleNamespace
+        return SimpleNamespace(content=self._content)
 
 
 class TestConvertAgentDispatch:
@@ -19,18 +29,20 @@ class TestConvertAgentDispatch:
 
     @pytest.fixture
     def mock_agent(self, tmp_path):
-        """Create a ConvertAgent with mocked LLM (single-shot chat API)."""
+        """Create a ConvertAgent with a fake harness returning a code block."""
         config = Config(
             source_dir=".",
             target_dir=str(tmp_path),
             api_key="test-key",
         )
-        mock_llm = MagicMock(spec=LLMClient)
-        # Single-shot: llm.chat() returns the converted code in a markdown block
-        mock_llm.chat.return_value = "```tsx\nconst App = () => <View />;\n```"
-        mock_state = MagicMock()
-        mock_state.is_completed.return_value = False
-        return ConvertAgent(config, mock_llm, mock_state)
+        harness = FakeHarness("```tsx\nconst App = () => <View />;\n```")
+        mock_state = MagicMockLike()
+        return ConvertAgent(config, harness, mock_state)
+
+
+class MagicMockLike:
+    def is_completed(self, key):
+        return False
 
     def test_convert_file_screens(self, mock_agent, tmp_path):
         src = tmp_path / "HomePage.dart"

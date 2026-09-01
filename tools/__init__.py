@@ -1,11 +1,8 @@
-"""tools — LangChain @tool-decorated tool functions invoked by agents.
+"""tools — LangChain @tool-decorated utility functions.
 
 Each tool is a stateless, self-documenting function decorated with
 langchain_core.tools.tool. The tool's docstring + parameter annotations
 serve as the LLM-facing schema — no separate JSON definition needed.
-
-All tools are registered in TOOLS and can be bound directly to
-ChatOpenAI instances or LangGraph ReAct agents.
 
 Key LangChain features used:
 - @tool decorator (auto-generates tool schema from type hints + docstring)
@@ -19,58 +16,12 @@ import json
 import re
 import subprocess
 from pathlib import Path
-from typing import Optional
 
 from langchain_core.tools import tool
 
 
 # =============================================================================
-# Tool 1: Read source file
-# =============================================================================
-
-
-@tool
-def read_source_file(file_path: str) -> str:
-    """Read a source file from disk and return its contents.
-
-    Args:
-        file_path: Absolute or relative path to the source file.
-    """
-    path = Path(file_path)
-    if not path.exists():
-        return f"Error: file not found: {file_path}"
-    try:
-        return path.read_text(encoding="utf-8")
-    except Exception as e:
-        return f"Error reading file: {e}"
-
-
-# =============================================================================
-# Tool 2: Write output file
-# =============================================================================
-
-
-@tool
-def write_output_file(code: str, output_path: str) -> str:
-    """Write generated TypeScript/TSX code to a target file.
-
-    Creates parent directories if they don't exist.
-
-    Args:
-        code: The TypeScript/TSX code to write.
-        output_path: Target path (relative or absolute).
-    """
-    path = Path(output_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        path.write_text(code, encoding="utf-8")
-        return f"Written: {path}"
-    except Exception as e:
-        return f"Error writing file: {e}"
-
-
-# =============================================================================
-# Tool 3: Scan and classify Flutter files
+# Tool 1: Scan and classify Flutter files
 # =============================================================================
 
 # Classification constants (reused from original scan_agent)
@@ -202,7 +153,7 @@ def scan_source_directory(source_dir: str) -> str:
 
 
 # =============================================================================
-# Tool 4: LLM-driven code extraction
+# Tool 2: LLM-driven code extraction
 # =============================================================================
 
 
@@ -228,8 +179,121 @@ def extract_code_from_response(response: str) -> str:
 
 
 # =============================================================================
-# Tool 5: Build verification
+# Tool 3: Reflection tool
 # =============================================================================
+
+
+@tool
+def reflect_on_conversion(
+    original_dart: str,
+    converted_typescript: str,
+    filename: str,
+) -> str:
+    """Reflect on the quality of a Flutter-to-RN conversion.
+
+    Returns a structured prompt for the review agent to evaluate.
+
+    Args:
+        original_dart: The original Flutter source code.
+        converted_typescript: The converted React Native code.
+        filename: Source file name for context.
+    """
+    return json.dumps({
+        "filename": filename,
+        "original_length": len(original_dart),
+        "converted_length": len(converted_typescript),
+        "review_instructions": (
+            "Check: widget mapping, state management (Provider→Context, setState→useState), "
+            "layout (Column/Row→flexbox), styling (BoxDecoration→StyleSheet), "
+            "imports (no dart imports, valid RN imports), "
+            "navigation (Navigator→React Navigation), lifecycle (initState→useEffect)."
+        ),
+    })
+
+
+# =============================================================================
+# Tool registry — bind these to any ChatOpenAI / LangGraph agent
+# =============================================================================
+
+TOOLS = [
+    classify_file,
+    scan_source_directory,
+    extract_code_from_response,
+    reflect_on_conversion,
+]
+
+
+# =============================================================================
+# Verify-fix tools — self-verifying ReAct loop for the build/auto-fix phase
+# =============================================================================
+
+
+@tool
+def read_source_file(file_path: str) -> str:
+    """Read a source file from disk and return its contents.
+
+    Args:
+        file_path: Absolute or relative path to the source file.
+    """
+    path = Path(file_path)
+    if not path.exists():
+        return f"Error: file not found: {file_path}"
+    try:
+        return path.read_text(encoding="utf-8")
+    except Exception as e:
+        return f"Error reading file: {e}"
+
+
+@tool
+def write_output_file(code: str, output_path: str) -> str:
+    """Write generated TypeScript/TSX code to a target file.
+
+    Creates parent directories if they don't exist.
+
+    Args:
+        code: The TypeScript/TSX code to write.
+        output_path: Target path (relative or absolute).
+    """
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.write_text(code, encoding="utf-8")
+        return f"Written: {path}"
+    except Exception as e:
+        return f"Error writing file: {e}"
+
+
+@tool
+def run_tsc_check(target_dir: str) -> str:
+    """Run TypeScript type-checking only — skips npm install for speed.
+
+    Use this to verify individual code fixes during the fix loop.
+    Only use run_build_check when you need to reinstall dependencies.
+
+    Returns BUILD_OK on success, or BUILD_ERRORS with the error output.
+
+    Args:
+        target_dir: React Native project directory.
+    """
+    target = Path(target_dir)
+    if not target.exists():
+        return f"Error: target directory not found: {target_dir}"
+    if not (target / "node_modules").exists():
+        return "Error: node_modules missing — run run_build_check first"
+
+    try:
+        tsc = subprocess.run(
+            ["npx", "tsc", "--noEmit"],
+            cwd=str(target),
+            capture_output=True, text=True, timeout=120,
+        )
+        if tsc.returncode == 0:
+            return "BUILD_OK"
+        return f"BUILD_ERRORS:\n{(tsc.stdout + tsc.stderr)[:3000]}"
+    except subprocess.TimeoutExpired:
+        return "Error: build timed out (120s)"
+    except Exception as e:
+        return f"Error running tsc: {e}"
 
 
 @tool
@@ -272,85 +336,11 @@ def run_build_check(target_dir: str) -> str:
         return f"Error running build: {e}"
 
 
-@tool
-def run_tsc_check(target_dir: str) -> str:
-    """Run TypeScript type-checking only — skips npm install for speed.
-
-    Use this to verify individual code fixes during the fix loop.
-    Only use run_build_check when you need to reinstall dependencies.
-
-    Returns BUILD_OK on success, or BUILD_ERRORS with the error output.
-
-    Args:
-        target_dir: React Native project directory.
-    """
-    target = Path(target_dir)
-    if not target.exists():
-        return f"Error: target directory not found: {target_dir}"
-    if not (target / "node_modules").exists():
-        return "Error: node_modules missing — run run_build_check first"
-
-    try:
-        tsc = subprocess.run(
-            ["npx", "tsc", "--noEmit"],
-            cwd=str(target),
-            capture_output=True, text=True, timeout=120,
-        )
-        if tsc.returncode == 0:
-            return "BUILD_OK"
-        return f"BUILD_ERRORS:\n{(tsc.stdout + tsc.stderr)[:3000]}"
-    except subprocess.TimeoutExpired:
-        return "Error: build timed out (120s)"
-    except Exception as e:
-        return f"Error running tsc: {e}"
-
-
-# =============================================================================
-# Tool 6: Reflection tool
-# =============================================================================
-
-
-@tool
-def reflect_on_conversion(
-    original_dart: str,
-    converted_typescript: str,
-    filename: str,
-) -> str:
-    """Reflect on the quality of a Flutter-to-RN conversion.
-
-    Returns a structured prompt for the review agent to evaluate.
-
-    Args:
-        original_dart: The original Flutter source code.
-        converted_typescript: The converted React Native code.
-        filename: Source file name for context.
-    """
-    return json.dumps({
-        "filename": filename,
-        "original_length": len(original_dart),
-        "converted_length": len(converted_typescript),
-        "review_instructions": (
-            "Check: widget mapping, state management (Provider→Context, setState→useState), "
-            "layout (Column/Row→flexbox), styling (BoxDecoration→StyleSheet), "
-            "imports (no dart imports, valid RN imports), "
-            "navigation (Navigator→React Navigation), lifecycle (initState→useEffect)."
-        ),
-    })
-
-
-# =============================================================================
-# Tool registry — bind these to any ChatOpenAI / LangGraph agent
-# =============================================================================
-
-TOOLS = [
+VERIFY_FIX_TOOLS = [
     read_source_file,
     write_output_file,
-    classify_file,
-    scan_source_directory,
-    extract_code_from_response,
-    run_build_check,
     run_tsc_check,
-    reflect_on_conversion,
+    run_build_check,
 ]
 
 
@@ -360,10 +350,7 @@ TOOLS = [
 
 
 class FileWriter:
-    """Write converted React Native files (kept for test compatibility).
-
-    Underlying file I/O delegates to write_output_file tool.
-    """
+    """Write converted React Native files (kept for test compatibility)."""
 
     def __init__(self, target_dir: str):
         self._target = Path(target_dir)

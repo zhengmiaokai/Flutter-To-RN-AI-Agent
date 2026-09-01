@@ -5,8 +5,8 @@ from prompts.convert import (
     FLUTTER_TO_RN_SYSTEM,
 )
 from prompts.verify import (
-    get_fix_prompt,
-    BUILD_FIX_SYSTEM,
+    get_hybrid_fix_prompt,
+    HYBRID_FIX_SYSTEM,
 )
 
 
@@ -47,7 +47,7 @@ class TestConversionPrompts:
         assert "const" in FLUTTER_TO_RN_SYSTEM
 
     def test_build_fix_prompt_exists(self):
-        assert BUILD_FIX_SYSTEM is not None
+        assert HYBRID_FIX_SYSTEM is not None
 
     def test_conversion_prompt_includes_source(self):
         prompt = get_conversion_prompt("class HomePage extends StatelessWidget {}", "HomePage.dart")
@@ -56,6 +56,6 @@ class TestConversionPrompts:
         assert "React Native" in prompt
 
     def test_fix_prompt_includes_error(self):
-        prompt = get_fix_prompt("const x = 1;", "TypeError: x", "test.tsx")
+        prompt = get_hybrid_fix_prompt("const x = 1;", "TypeError: x", "test.tsx")
         assert "TypeError: x" in prompt
         assert "test.tsx" in prompt

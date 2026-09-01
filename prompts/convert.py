@@ -65,6 +65,18 @@ No explanations, no markdown outside the code block.
 - Providers → `src/providers/<name>.tsx`
 - Utils → `src/utils/<name>.ts`
 
+## Export & Barrel Conventions — MUST FOLLOW
+
+Dart has no `export default`; its "export everything" barrels map to TS named exports. Keep import/export forms consistent — mismatches (named import of a default-only export, or `export *` over a default export) cause TS2305/TS2306 build failures.
+
+1. **Services / models / utils / providers**: use **named exports** (`export class`, `export interface`, `export const`). This is the established project convention.
+2. **Barrel files** (a file containing only `export ...` re-exports, like Dart's `export 'src/x.dart'`):
+   - If the target file uses named exports → `export * from './x';`
+   - If the target file uses a default export → forward it by name: `export { default as X } from './x';`
+   - `export *` does NOT forward default exports.
+3. **Screens / components**: `export default` is allowed, but importers must use default imports (`import X from '...'`), and any barrel re-exporting them must use `export { default as X }`.
+4. Match the import to the module's actual export form — never `import { X }` a module that only default-exports X.
+
 ## Quality Requirements — MUST FOLLOW
 
 1. **Define props interfaces** for every component. Never use `any` for props. Convert Flutter's named parameters into proper TypeScript interfaces:

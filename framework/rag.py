@@ -126,6 +126,15 @@ class RAGEngine:
         # Embedding dimension tracking
         self._embedding_dim: int | None = None
 
+        # Retrieve cache: same (source, k) → same results, so rework/re-review
+        # of an unchanged file skips re-embedding + retrieval entirely.
+        self._retrieve_cache: dict[str, list[dict]] = {}
+
+    @staticmethod
+    def _truncate_query(query_code: str, limit: int = 1500) -> str:
+        """Cap the embedding query — the tail of a large file adds no signal."""
+        return query_code[:limit] if query_code and len(query_code) > limit else query_code
+
     # ── Initialization (deferred) ──────────────────────────────────────────
 
     def _ensure_init(self):
@@ -332,6 +341,19 @@ class RAGEngine:
         self._ensure_init()
         if self._vectorstore is None:
             return []
+
+        # Truncate the embedding query so huge files don't cost a full embed.
+        query_code = self._truncate_query(query_code)
+
+        # Retrieve cache — keyed by truncated query + filename + k. Identical
+        # re-conversion/re-review of an unchanged file reuses this.
+        cache_key = hashlib.md5(
+            f"{query_code}|{filename}|{k}|{score_threshold}".encode()
+        ).hexdigest()
+        cached = self._retrieve_cache.get(cache_key)
+        if cached is not None:
+            return [dict(r) for r in cached]
+
         retriever = self._vectorstore.as_retriever(
             search_type="similarity_score_threshold" if score_threshold else "similarity",
             search_kwargs={"k": k, "score_threshold": score_threshold}
@@ -354,6 +376,12 @@ class RAGEngine:
                 "category": doc.metadata.get("category", "other"),
                 "type": doc.metadata.get("type", "source"),
             })
+
+        # Bound cache size (cap at a few hundred entries, drop oldest)
+        if len(self._retrieve_cache) > 500:
+            for stale in list(self._retrieve_cache)[:100]:
+                self._retrieve_cache.pop(stale, None)
+        self._retrieve_cache[cache_key] = [dict(r) for r in results]
 
         return results
 

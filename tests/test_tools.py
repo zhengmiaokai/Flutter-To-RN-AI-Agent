@@ -2,7 +2,17 @@
 from pathlib import Path
 
 import pytest
-from tools import FileWriter, classify_file, extract_code_from_response, scan_source_directory
+from tools import (
+    FileWriter,
+    VERIFY_FIX_TOOLS,
+    classify_file,
+    extract_code_from_response,
+    read_source_file,
+    run_build_check,
+    run_tsc_check,
+    scan_source_directory,
+    write_output_file,
+)
 
 
 class TestClassifyFileTool:
@@ -80,6 +90,47 @@ class TestExtractCodeFromResponse:
     def test_no_block(self):
         result = extract_code_from_response.invoke({"response": "const x = 1;"})
         assert result == ""
+
+
+class TestVerifyFixTools:
+    """Tests for the ReAct verify-fix tools."""
+
+    def test_verify_fix_tools_registry(self):
+        assert {t.name for t in VERIFY_FIX_TOOLS} == {
+            "read_source_file",
+            "write_output_file",
+            "run_tsc_check",
+            "run_build_check",
+        }
+
+    def test_read_source_file(self, tmp_path):
+        f = tmp_path / "a.ts"
+        f.write_text("export const x = 1;")
+        assert read_source_file.invoke({"file_path": str(f)}) == "export const x = 1;"
+
+    def test_read_source_file_missing(self, tmp_path):
+        result = read_source_file.invoke({"file_path": str(tmp_path / "nope.ts")})
+        assert result.startswith("Error: file not found")
+
+    def test_write_output_file_creates_parents(self, tmp_path):
+        out = tmp_path / "src" / "screens" / "Home.tsx"
+        result = write_output_file.invoke({"code": "const Home = () => <View />;", "output_path": str(out)})
+        assert "Written" in result
+        assert out.exists()
+        assert out.read_text() == "const Home = () => <View />;"
+
+    def test_run_tsc_check_requires_node_modules(self, tmp_path):
+        # Guard triggers before any subprocess call — no node_modules present.
+        result = run_tsc_check.invoke({"target_dir": str(tmp_path)})
+        assert "node_modules missing" in result
+
+    def test_run_tsc_check_missing_dir(self, tmp_path):
+        result = run_tsc_check.invoke({"target_dir": str(tmp_path / "missing")})
+        assert "target directory not found" in result
+
+    def test_run_build_check_missing_dir(self, tmp_path):
+        result = run_build_check.invoke({"target_dir": str(tmp_path / "missing")})
+        assert "target directory not found" in result
 
 
 class TestFileWriter:

@@ -1,13 +1,14 @@
 """agents/reflect_agent — Self-correction for conversion quality review.
 
-Reviews conversion quality using an LLM call with a Pydantic
-output schema. Compares original Flutter against converted React Native
-and identifies gaps.
+Reviews conversion quality via a harness LLM call with JSON output. Compares
+original Flutter against converted React Native and identifies gaps.
 
-Uses a two-tier approach:
-1. Try LangChain's with_structured_output() (requires tool-calling support)
-2. Fall back to plain chat + JSON parsing when structured output is unavailable
-
+Optimizations over the original single-call path:
+- json_object response format (fallback to plain JSON parsing when the
+  provider rejects it)
+- adaptive truncation: each side capped at 8K chars instead of 16K
+- reflect_batch(): several files reviewed in one call to amortize the system
+  prompt, with per-file fallback on parse failure
 """
 
 from __future__ import annotations
@@ -16,10 +17,8 @@ import json
 import re
 
 from pydantic import BaseModel, Field, ConfigDict
-from langchain_core.messages import HumanMessage, SystemMessage
 
 from framework.config import Config
-from framework.llm import LLMClient
 from agents.base import BaseAgent
 
 _REFLECT_SYSTEM = """You are an expert code reviewer specializing in Flutter to React Native migrations.
@@ -80,6 +79,34 @@ Output a JSON object:
 
 Output ONLY the JSON object, no explanations, no markdown formatting."""
 
+# Batch-mode override appended to the system prompt. Later instructions win.
+_BATCH_SUFFIX = """
+## MULTI-FILE MODE
+
+You are reviewing MULTIPLE conversions in one call. Each file is presented as:
+
+### FILE <index>: <filename>
+## Original Flutter Source
+```
+...
+```
+## Converted React Native Code
+```typescript
+...
+```
+
+For EACH file, apply the 8-dimension review above. Output ONE JSON object
+mapping each filename to its report:
+{
+  "<filename1>": {"pass": true/false, "score": 0-100, "issues": [...], "summary": "..."},
+  "<filename2>": {...}
+}
+Use the exact filenames provided. Output ONLY the JSON object, no markdown."""
+
+# Adaptive truncation — each side capped at 8K chars (16K previously).
+_MAX_CODE_CHARS = 8000
+_BATCH_SIZE = 10
+
 
 class ReflectResult(BaseModel):
     """Structured result from a reflection pass."""
@@ -111,9 +138,6 @@ class ReflectResult(BaseModel):
     def needs_rework(self) -> bool:
         """Return True if re-conversion is needed (score < 90 or any critical)."""
         return not self.pass_ or self.score < 90 or self.critical_count > 0
-
-
-_MAX_CODE_CHARS = 16000
 
 
 def _extract_json(text: str) -> str | None:
@@ -149,19 +173,26 @@ def _extract_json(text: str) -> str | None:
 
     return None
 
- 
+
+def _normalize_issues(raw_issues: list) -> list[dict]:
+    """Normalize issues the LLM might return as strings instead of dicts."""
+    if not raw_issues:
+        return []
+    if isinstance(raw_issues[0], str):
+        return [
+            {"severity": "warning", "category": "general", "description": i, "suggestion": ""}
+            for i in raw_issues
+        ]
+    return raw_issues
+
+
 class ReflectAgent(BaseAgent):
-    """Agent that reviews conversion output quality and triggers rework.
+    """Agent that reviews conversion output quality and triggers rework."""
 
-    Uses a two-tier approach:
-    1. Try LangChain's with_structured_output() (tool-calling path).
-    2. Fall back to plain chat + JSON parsing when structured output is
-       unavailable (e.g., models that don't support tool calling).
+    def __init__(self, config: Config, harness=None):
+        super().__init__(config, harness)
 
-    """
-
-    def __init__(self, config: Config, llm: LLMClient):
-        super().__init__(config, llm)
+    # ---- single-file reflection --------------------------------------------
 
     def reflect(
         self,
@@ -169,80 +200,159 @@ class ReflectAgent(BaseAgent):
         flutter_source: str,
         filename: str,
     ) -> ReflectResult:
-        """Review a single file's conversion quality using a structured LLM call.
-
-        Two-tier approach:
-        - Tier 1: LangChain's with_structured_output() (fast, schema-enforced).
-        - Tier 2: Plain chat + JSON parsing (works with any model).
-
-        Args:
-            rn_code: The converted React Native code.
-            flutter_source: The original Flutter Dart source code.
-            filename: Original file name.
-
-        Returns:
-            ReflectResult with pass/fail, score, and issue list.
-        """
-        if not self.llm:
+        """Review a single file's conversion quality using a harness call."""
+        if not self.harness:
             return ReflectResult(
                 pass_=False, score=50,
                 summary=f"Reviewed {filename} (no LLM)",
             )
 
-        # Build the reflection message content
-        msg_content = (
+        json_prompt = self._build_message(rn_code, flutter_source, filename) + (
+            "\n\nOutput your quality report as a raw JSON object "
+            "(no markdown, no code fences)."
+        )
+
+        try:
+            result = self.harness.call(
+                task_type="reflect",
+                system_prompt=_REFLECT_SYSTEM,
+                user_message=json_prompt,
+                temperature=0.0,
+                response_format="json_object",
+                cache=True,
+            )
+            parsed = self._parse_response(result.content, filename)
+            if parsed is not None:
+                return parsed
+            self.log_warn("Reflect", f"Unparseable response for {filename}")
+        except Exception as exc:
+            self.log_warn("Reflect", f"Reflection failed for {filename}: {exc}")
+
+        return ReflectResult(
+            pass_=False, score=50,
+            summary="Reflection skipped due to error.",
+        )
+
+    # ---- batched reflection (amortizes system prompt across files) ---------
+
+    def reflect_batch(
+        self,
+        items: list[tuple],
+    ) -> dict[str, ReflectResult]:
+        """Review multiple files in one batched LLM call.
+
+        Args:
+            items: list of (key, rn_code, flutter_source, filename) tuples.
+
+        Returns:
+            {key: ReflectResult}. Files that fail batch parsing are reviewed
+            individually as a fallback, so every input file gets a result.
+        """
+        if not self.harness or not items:
+            return {}
+
+        results: dict[str, ReflectResult] = {}
+        remaining = list(items)
+        batches = [remaining[i:i + _BATCH_SIZE] for i in range(0, len(remaining), _BATCH_SIZE)]
+
+        for batch in batches:
+            parts = ["Review the following conversions:\n"]
+            for i, (key, rn_code, flutter_source, filename) in enumerate(batch, 1):
+                parts.append(
+                    f"### FILE {i}: {filename}\n"
+                    f"## Original Flutter Source\n```\n{flutter_source[:_MAX_CODE_CHARS]}\n```\n\n"
+                    f"## Converted React Native Code\n"
+                    f"```typescript\n{rn_code[:_MAX_CODE_CHARS]}\n```\n"
+                )
+            user_message = "\n".join(parts)
+
+            try:
+                result = self.harness.call(
+                    task_type="reflect",
+                    system_prompt=_REFLECT_SYSTEM + "\n\n" + _BATCH_SUFFIX,
+                    user_message=user_message,
+                    temperature=0.0,
+                    response_format="json_object",
+                    cache=True,
+                )
+            except Exception as exc:
+                self.log_warn("Reflect", f"Batch reflect failed: {exc}")
+                result = None
+
+            parsed_map: dict[str, ReflectResult] = {}
+            if result is not None:
+                parsed_map = self._parse_batch(result.content)
+                if not parsed_map:
+                    self.log_warn("Reflect", "Batch reflect produced no parseable reports")
+
+            # Route: parsed keys → batch results; unparsed keys → individual fallback
+            fallback = []
+            for key, rn_code, flutter_source, filename in batch:
+                if filename in parsed_map:
+                    results[key] = parsed_map[filename]
+                else:
+                    fallback.append((key, rn_code, flutter_source, filename))
+            for key, rn_code, flutter_source, filename in fallback:
+                results[key] = self.reflect(rn_code, flutter_source, filename)
+
+        return results
+
+    # ---- prompt / parse helpers --------------------------------------------
+
+    @staticmethod
+    def _build_message(rn_code: str, flutter_source: str, filename: str) -> str:
+        return (
             f"Review the following Flutter-to-RN conversion for '{filename}':\n\n"
             f"## Original Flutter Source\n"
             f"```\n{flutter_source[:_MAX_CODE_CHARS]}\n```\n\n"
             f"## Converted React Native Code\n"
             f"```typescript\n{rn_code[:_MAX_CODE_CHARS]}\n```\n\n"
+            "Output the quality report now."
         )
 
-        msg_content += "Output the quality report now."
-
-        result: ReflectResult | None = None
-
-        # ── Tier 1: Plain chat + JSON parsing ───────────────────────────
-        # Note: Structured output via tool calling is intentionally skipped.
-        # The API provider may run in "thinking mode" which is incompatible with
-        # function calling / tool_choice. Plain chat + JSON extraction is the
-        # most compatible approach across all OpenAI-compatible backends.
+    def _parse_response(self, text: str, filename: str) -> ReflectResult | None:
+        """Parse a single-file reflection response into a ReflectResult."""
+        json_str = _extract_json(text)
+        if not json_str:
+            return None
         try:
-            json_prompt = msg_content + (
-                "\n\nOutput your quality report as a raw JSON object "
-                "(no markdown, no code fences)."
-            )
-            response = self.llm.chat(_REFLECT_SYSTEM, json_prompt)
-            json_str = _extract_json(response)
-            if json_str:
-                data = json.loads(json_str)
-                # Normalize issues: the LLM might return strings instead of dicts
-                raw_issues = data.get("issues", [])
-                if raw_issues and isinstance(raw_issues[0], str):
-                    issues = [
-                        {"severity": "warning", "category": "general", "description": i, "suggestion": ""}
-                        for i in raw_issues
-                    ]
-                else:
-                    issues = raw_issues
-                result = ReflectResult(
-                    pass_=data.get("pass", False),
-                    score=data.get("score", 50),
-                    issues=issues,
-                    summary=data.get("summary", ""),
+            data = json.loads(json_str)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(data, dict):
+            return None
+        return ReflectResult(
+            pass_=data.get("pass", False),
+            score=data.get("score", 50),
+            issues=_normalize_issues(data.get("issues", [])),
+            summary=data.get("summary", ""),
+        )
+
+    def _parse_batch(self, text: str) -> dict[str, ReflectResult]:
+        """Parse a batch response into {filename: ReflectResult}."""
+        json_str = _extract_json(text)
+        if not json_str:
+            return {}
+        try:
+            data = json.loads(json_str)
+        except json.JSONDecodeError:
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        out: dict[str, ReflectResult] = {}
+        for filename, report in data.items():
+            if not isinstance(report, dict):
+                continue
+            try:
+                out[filename] = ReflectResult(
+                    pass_=report.get("pass", False),
+                    score=report.get("score", 50),
+                    issues=_normalize_issues(report.get("issues", [])),
+                    summary=report.get("summary", ""),
                 )
-        except Exception as exc:
-            self.log_warn("Reflect", f"JSON fallback also failed for {filename}: {exc}")
-
-        # Fallback: no result obtained
-        if result is None:
-            self.log_warn("Reflect", f"All reflection methods failed for {filename}")
-            result = ReflectResult(
-                pass_=False, score=50,
-                summary="Reflection skipped due to error.",
-            )
-
-        return result
+            except Exception:
+                continue
+        return out
 
     def should_retry(self, result: ReflectResult, attempt: int, max_retries: int = 2) -> bool:
         """Decide whether to trigger re-conversion based on reflection result."""
