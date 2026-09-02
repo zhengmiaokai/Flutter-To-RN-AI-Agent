@@ -107,63 +107,71 @@ python3 main.py --route convert=claude-sonnet-5 --route scan_classify=deepseek-c
 
 ## 系统架构
 
-采用**分层架构**，自顶向下共七层，层间通过 `Config`、`Harness`、`StateManager` 全局共享（`Harness` 为所有 LLM 调用的唯一入口）：
+采用**分层架构**：编排层按**任务先后**执行（Setup→Scan→CopyAssets→Convert→Verify），能力层把 Skill 与 Agent 收进**同一个大层、同级左右并列**（不上下分层）、按职责**分区隔离**；下层保留 Tools / Prompts / Framework 底座（`Harness` 为所有 LLM 调用的唯一入口）：
 
 ```
- ┌───────────────────────────────────────────────────┐
- │                    CLI 入口                         │
- │                   main.py                          │
- └───────────────────────┬───────────────────────────┘
-                         │
- ┌───────────────────────▼───────────────────────────┐
- │                    编排层                           │
- │               orchestration/                       │
- │        LangGraph StateGraph · 5 阶段 Pipeline       │
- │     Setup → Scan → Copy Assets → Convert → Verify  │
- └───────────────────────┬───────────────────────────┘
-                         │
- ┌───────────────────────▼───────────────────────────┐
- │                   Agent 层                         │
- │                   agents/                          │
- │   ScanAgent       ConvertAgent    ReflectAgent     │
- │   VerifyAgent     BaseAgent                        │
- │   (各阶段核心逻辑 + RAG 检索 (Convert/Verify))        │
- └───────────────────────┬───────────────────────────┘
-                         │
- ┌───────────────────────▼───────────────────────────┐
- │                   Tools 层                         │
- │                   tools/                           │
- │ 8 个 @tool · TOOLS(通用) + VERIFY_FIX_TOOLS(ReAct) │
- └───────────────────────┬───────────────────────────┘
-                         │
- ┌───────────────────────▼───────────────────────────┐
- │                  Prompts 层                        │
- │                  prompts/                          │
- │    按文件类别组合差异化 LLM 提示词                     │
- └───────────────────────┬───────────────────────────┘
-                         │
- ┌───────────────────────▼───────────────────────────┐
- │                  Framework 层                      │
- │                  framework/                        │
- │   harness / memory / llm / config / state /        │
- │   state_machine / rag                              │
- │   (Harness 编排 · 多模型路由 · 跨运行记忆 ·        │
- │    Chroma 向量库 · 双嵌入策略 · 两类索引)            │
- └───────────────────────┬───────────────────────────┘
-                         │
- ┌───────────────────────▼───────────────────────────┐
- │                 Templates 层                       │
- │                 templates/                         │
- │   package.json / App.tsx / AppNavigator.tsx / ...  │
- └───────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│  编排层 orchestration/（LangGraph StateGraph · 任务先后）   │
+│                                                             │
+│    Setup ──→ Scan ──→ CopyAssets ──→ Convert ──→ Verify     │
+│                                                             │
+│  Verify 失败 → 调用能力层 FixAgent（ReAct 修复）            │
+└──────────────────────────────┬──────────────────────────────┘
+                               │                               
+                        各阶段节点调用                         
+                               ▼                               
+┌──────────────────────────────┴──────────────────────────────┐
+│  能力层 · skills/ + agents/（Skill 与 Agent 同级并列）      │
+│ ┌────────────────────────┬────────────────────────────────┐ │
+│ │  Skill（单次 · 契约化）│  Agent（ReAct 修复循环）       │ │
+│ │  ScanSkill             │  FixAgent（流水线唯一 ReAct）  │ │
+│ │  ConvertSkill          │  读 → 写 → tsc → 迭代          │ │
+│ │  ReflectSkill          │  （内含单次降级兜底）          │ │
+│ └────────────────────────┴────────────────────────────────┘ │
+│  Skill 单次调用 harness.call() · Agent 走 ReAct 循环        │
+└──────────────────────────────┬──────────────────────────────┘
+                               │                               
+                 工具绑定 · 提示词模板 · 基础设施            
+                               ▼                               
+┌──────────────────────────────┴──────────────────────────────┐
+│  底座层 · tools / prompts / framework                       │
+│                                                             │
+│  tools/     TOOLS（通用）+ VERIFY_FIX_TOOLS（ReAct 修复）   │
+│  prompts/   scan · convert · reflect · verify 提示词模板    │
+│  framework/ Harness（LLM 编排）· 记忆 · LLM · RAG · Config  │
+└─────────────────────────────────────────────────────────────┘
 ```
+
+> 版式说明：编排层按**任务先后**（Setup→Scan→CopyAssets→Convert→Verify）横向排版；能力层把 Skill 与 Agent 收进**同一个大层、同级左右并列**（不上下分层），内部按职责**分区隔离**；fix 子流程只有 `FixAgent` 一个实体（ReAct 修复），单次降级是其内部实现、不单列。下方保留 **Tools / Prompts / Framework** 底座层，供能力层复用（工具绑定 / 提示词模板 / `harness.call()`）。
+
+### 能力层：Skill 与 Agent 的分工
+
+流水线里只有一个 **Agent：`FixAgent`**（以 ReAct 工具循环实现，绑定读写与 tsc 工具自验证迭代）；Scan / Convert / Reflect 则是**单次 Skill**（一次 `harness.call()`，不跑工具循环）。二者按三把尺子区分归属：
+
+| 判断维度 | Scan · Convert · Reflect | Verify 修复 |
+|---------|--------------------------|-------------|
+| ① 决策空间 | 无——代码编排即可完成 | 有——修复策略需模型判断 |
+| ② 硬反馈闭环 | 无（正确性由外层 StateMachine 兜底） | 有——tsc 即反馈 |
+| ③ 迭代收益 > 成本 | 否（套 ReAct = 空转 + 破坏 harness 缓存 + token ×N） | 是——读 → 写 → tsc → 迭代收敛 |
+| 归属 | **Skill**（`skills/`，单次 `harness.call()`） | **Agent**（`agents/fix_agent.py`） |
+
+**角色归位对照**（本次整改）：
+
+| 原结构 | 归位后 |
+|--------|--------|
+| `agents/scan_agent.py` ScanAgent | `skills/scan_skill.py` **ScanSkill** |
+| `agents/convert_agent.py` ConvertAgent | `skills/convert_skill.py` **ConvertSkill** |
+| `agents/reflect_agent.py` ReflectAgent | `skills/reflect_skill.py` **ReflectSkill**（含 `ReflectResult`） |
+| `agents/verify_agent.py` VerifyAgent（一拆二） | `orchestration/verify.py` **VerifyPhase**（确定性编排）+ `agents/fix_agent.py` **FixAgent**（唯一 ReAct 修复，单次降级内聚） |
+
+每个 Skill 声明 `name` / `description` + docstring 输入输出契约（可发现、可调度，便于将来由 Agent 复用/编排）。依赖方向无环：`skills/` 不 import `agents/`、`agents/` 不 import `skills/`，唯一跨层是 `VerifyPhase` 经 `set_fix_agent` 注入 `FixAgent`。
 
 ### RAG 引擎
 
-RAG 引擎（`framework/rag.py`）为 ConvertAgent（Dart 源码 → 语义上下文）和 VerifyAgent（TS 类型定义 → 修复参考）提供语义检索，基于 Chroma 向量库。
+RAG 引擎（`framework/rag.py`）为 ConvertSkill（Dart 源码 → 语义上下文）和 VerifyPhase（TS 类型定义 → 修复参考）提供语义检索，基于 Chroma 向量库。
 
 - **双嵌入策略**：OpenAI API 用户 → 远程 `text-embedding-3-small`；非 OpenAI 用户 → 自动回退本地 `all-MiniLM-L6-v2`（~80MB）；均不可用 → RAG 静默禁用，降级为文件名匹配。
-- **索引**：转换前 Dart 源码按结构边界分块（chunk_size=600）；转换后 TS 输出重建索引（chunk_size=800）供 VerifyAgent 检索。
+- **索引**：转换前 Dart 源码按结构边界分块（chunk_size=600）；转换后 TS 输出重建索引（chunk_size=800）供 VerifyPhase 检索。
 - **优化**：检索结果缓存（键 = 截断查询 + 文件名 + k，超 500 条淘汰最早 100）、查询截断（`query_code` 仅取前 N 字符嵌入）、类别门控（仅 screens/widgets/providers 走 RAG，简单类别用 companion 上下文）。
 
 ### Harness 统一编排层
@@ -182,7 +190,7 @@ harness.call(task_type, system_prompt, user_message, ...)
   └─ 账本:     input/output token + 缓存命中 token + 推理 token 落盘审计
 ```
 
-> Agentic 路径（Verify 的 ReAct 修复循环）绕过 `call()` 直接经 LLM 实例池调模型，但通过 `record_usage()` / `over_budget()` 与 `call()` 共享同一 Token 账本与预算守护，审计与预算不遗漏。
+> Agentic 路径（FixAgent 的 ReAct 修复循环）绕过 `call()` 直接经 LLM 实例池调模型，但通过 `record_usage()` / `over_budget()` 与 `call()` 共享同一 Token 账本与预算守护，审计与预算不遗漏。
 
 **按任务自适应 + 模型路由：** 未配置路由时，所有调用共用全局模型（`--model`，默认 `deepseek-v4-pro`）。"智能"体现在 Harness 对每次调用按其任务类型自动调整调用参数——代码生成类任务（convert / convert_fix / verify_fix）分配大输出预算（`max_tokens=8192`），分类类任务（scan_classify）只需小预算（`2048`），评审类（reflect）居中（`4096`）；调用方也可传 `max_tokens` 临时覆盖。配置 `MODEL_ROUTES`（或 `--route`）后，同一套 `task_type` 同时决定调用参数与目标模型，主模型失败自动降级到 `fallback_model`，详见[模型路由](#模型路由)。
 
@@ -228,7 +236,7 @@ setup ──→ scan ──→ copy_assets ──→ convert ──→ verify �
 
 ### Phase 2 · Scan — 文件扫描与分类
 
-`ScanAgent` 将 Flutter 源码分类为 screens / widgets / services / models / providers / utils / assets。采用**目录名规则初筛 → 必要时 LLM 批量补充**的两阶段策略（每批 50 文件，仅发前 20 行预览）。
+`ScanSkill` 将 Flutter 源码分类为 screens / widgets / services / models / providers / utils / assets。采用**目录名规则初筛 → 必要时 LLM 批量补充**的两阶段策略（每批 50 文件，仅发前 20 行预览）。
 
 | 扫描模式 | 原理 | 适用场景 |
 |------|------|----------|
@@ -242,9 +250,9 @@ setup ──→ scan ──→ copy_assets ──→ convert ──→ verify �
 
 ### Phase 4 · Convert — 代码转换 + 质量审查
 
-**（A）RAG 索引构建**：转换前索引 Dart 源码，转换完成后对 TS 输出重建索引，供 VerifyAgent 检索（分块参数见上文 RAG 引擎）。
+**（A）RAG 索引构建**：转换前索引 Dart 源码，转换完成后对 TS 输出重建索引，供 VerifyPhase 检索（分块参数见上文 RAG 引擎）。
 
-**（B）ConvertAgent**（单次 LLM 调用）：按文件类别组合差异化提示词，每类别仅发送相关映射规则：
+**（B）ConvertSkill**（单次 LLM 调用）：按文件类别组合差异化提示词，每类别仅发送相关映射规则：
 
 | 类别 | 输出目录 | 提示词组成 |
 |------|---------|-----------|
@@ -257,7 +265,7 @@ setup ──→ scan ──→ copy_assets ──→ convert ──→ verify �
 
 输出解析失败时自动重试一次（关闭缓存、温度升到 0.4）；若产物含 JSX 但扩展名是 `.ts`，自动升级保存为 `.tsx`。
 
-**（C）ReflectAgent**（Convert 子阶段）：对 screens/widgets 文件执行质量审查（**批量 LLM 调用**：每批 10 文件、单侧 8K 自适应截断，批解析失败的文件自动回退为单独审查），起始 100 分：
+**（C）ReflectSkill**（Convert 子阶段）：对 screens/widgets 文件执行质量审查（**批量 LLM 调用**：每批 10 文件、单侧 8K 自适应截断，批解析失败的文件自动回退为单独审查），起始 100 分：
 
 | 维度 | 扣分 |
 |------|------|
@@ -273,11 +281,11 @@ setup ──→ scan ──→ copy_assets ──→ convert ──→ verify �
 
 ### Phase 5 · Verify — 构建验证
 
-`VerifyAgent`：`npm install`（`node_modules` 已存在则跳过，节省每次重试约 30s）→ `tsc --noEmit` → 失败自动修复并重试。修复循环由 LangGraph `StateMachine` 驱动（install → build → check → fix → build…）。tsc 错误自动解析为结构化对象（`TscErrorGroup`），按 import → declaration → type → syntax → unused 优先级排序修复；**无进展检测**——连续两轮错误签名完全一致时判定修复无进展，直接 `gave_up` 停止而非重复调用 LLM。修复所需的跨文件上下文优先通过 RAG 检索类型定义，回退策略为扫描 import 语句提取导出签名。
+`VerifyPhase`（orchestration/verify.py）：`npm install`（`node_modules` 已存在则跳过，节省每次重试约 30s）→ `tsc --noEmit` → 失败自动修复并重试。修复循环由 LangGraph `StateMachine` 驱动（install → build → check → fix → build…）。tsc 错误自动解析为结构化对象（`TscErrorGroup`），按 import → declaration → type → syntax → unused 优先级排序修复；**无进展检测**——连续两轮错误签名完全一致时判定修复无进展，直接 `gave_up` 停止而非重复调用 LLM。修复所需的跨文件上下文优先通过 RAG 检索类型定义，回退策略为扫描 import 语句提取导出签名。
 
-**修复方式为「ReAct 优先 + 单次兜底」两路径混合**：
-- **ReAct 自验证循环（首选）**：LangGraph ReAct agent 绑定 `VERIFY_FIX_TOOLS`（`read_source_file` / `write_output_file` / `run_tsc_check` / `run_build_check`），按「读 → 写 → 本地 tsc 自验证 → 迭代直到 BUILD_OK」工作（`recursion_limit=20`）。内部调用绕过 `harness.call()`，但经 `record_usage()` / `over_budget()` 与主账本共享 Token 计量与预算守护。
-- **单次调用兜底**：当模型不支持 function calling，或 ReAct 未产生有效写入时，回退为单次 `harness.call(task_type="verify_fix")` —— 内联文件 + 结构化错误 + 跨文件导出签名 + 修复记忆，直接返回完整修正文件，由外层 StateMachine 以 `tsc` 验证。
+VerifyPhase 是**确定性编排**，不亲自修文件——它把每文件的跨文件上下文 + 修复记忆（fix-memo）各算一次，委托 **`FixAgent`（agents/fix_agent.py，流水线唯一的 ReAct Agent）** 执行修复。FixAgent 内部是「**ReAct 优先 + 单次降级**」策略梯（单次修复是内部降级模式，不单列实体）：
+- **ReAct 自验证循环（首选）**：LangGraph ReAct agent 绑定 `VERIFY_FIX_TOOLS`（`read_source_file` / `write_output_file` / `run_tsc_check` / `run_build_check`），按「读 → 写 → 本地 tsc 自验证 → 迭代直到 BUILD_OK」工作（`recursion_limit=20`）；编译图按连接（model|base_url|api_key）缓存逐文件复用，主连接失败自动切 `fallback_model` 再试一次。内部调用绕过 `harness.call()`，但经 `record_usage()` / `over_budget()` 与主账本共享 Token 计量与预算守护（循环内按步记账；`_BudgetCallback` 在 `on_llm_start` 超预算时置位、`invoke()` 返回后抛 `BudgetExceededError`）。
+- **单次降级兜底**：无 LLM / ReAct 抛非预算异常 / ReAct 无有效写入时，回退为单次 `harness.call(task_type="verify_fix")` —— 内联文件 + 结构化错误 + 跨文件导出签名 + 修复记忆，直接返回完整修正文件，由外层 StateMachine 以 `tsc` 验证。
 - 修复成功（tsc 通过）即写入 fix-memo（②），下次同 `error_code` 时自动注入提示。
 
 ---
@@ -350,25 +358,30 @@ Flutter-to-RN/
 ├── .env.example                      # 环境变量示例（含模型路由 / Harness 开关）
 ├── orchestration/                    # 编排层
 │   ├── pipeline.py                   #   LangGraph StateGraph 主编排
+│   ├── verify.py                     #   VerifyPhase：tsc 解析 + 委托 FixAgent 修复
 │   └── setup.py                      #   RN 项目骨架生成
-├── agents/                           # Agent 层
-│   ├── base.py                       #   Agent 基类 + Agent 工厂
-│   ├── scan_agent.py                 #   文件扫描分类
-│   ├── convert_agent.py              #   代码转换
-│   ├── reflect_agent.py              #   质量审查+重转
-│   └── verify_agent.py               #   构建验证+修复
+├── skills/                           # Skill 能力层（单次 · 契约化）
+│   ├── base.py                       #   BaseSkill 基类 + 日志助手 + name/description 契约
+│   ├── scan_skill.py                 #   ScanSkill：文件扫描分类
+│   ├── convert_skill.py              #   ConvertSkill：代码转换
+│   ├── reflect_skill.py              #   ReflectSkill：质量审查+重转（含 ReflectResult）
+│   └── __init__.py                   #   导出
+├── agents/                           # Agent 层（ReAct 修复）
+│   ├── base.py                       #   Agent 基类 + ReAct 工厂
+│   └── fix_agent.py                  #   FixAgent：ReAct 修复循环 + 单次降级兜底
 ├── tools/                            # @tool 函数（TOOLS + VERIFY_FIX_TOOLS 双注册表）
 ├── prompts/                          # LLM 提示词模板
 ├── framework/                        # 基础设施
 │   ├── config.py                     #   配置（预算/缓存/记忆字段 + .env 解析）
 │   ├── harness.py                    #   LLM 统一编排（自适应/账本/缓存/记忆/预算/重试封顶）
+│   ├── file_categories.py            #   文件类别推断（fix 路由 / 记忆共用）
 │   ├── memory.py                     #   跨运行记忆（few-shots / fix-memos / 评分记忆 / 摘要）
 │   ├── llm.py                        #   多模型路由实例池
 │   ├── state.py                      #   状态持久化
 │   ├── state_machine.py              #   状态机
 │   └── rag.py                        #   RAG 引擎
 ├── templates/                        # RN 项目模板
-├── tests/                            # pytest 测试（93 用例）
+├── tests/                            # pytest 测试（102 用例）
 └── sample/                           # 示例 Flutter 项目
 ```
 

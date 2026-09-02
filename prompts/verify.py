@@ -1,7 +1,7 @@
 """prompts/verify — TypeScript build verification and fix prompts.
 
-Used by VerifyAgent to auto-fix TypeScript build errors in the
-converted React Native project.
+Used by FixAgent to auto-fix TypeScript build errors in the
+converted React Native project (single-shot degraded mode + ReAct loop).
 """
 
 import re
@@ -74,7 +74,7 @@ def categorize_errors(tsc_output: str) -> dict[str, list[str]]:
 
 
 # =============================================================================
-# Hybrid single-shot fix system prompt (default VerifyAgent path)
+# Hybrid single-shot fix system prompt (FixAgent degraded mode)
 # =============================================================================
 
 HYBRID_FIX_SYSTEM = """You are an expert React Native TypeScript developer fixing a TypeScript build failure.
@@ -149,7 +149,7 @@ Return the COMPLETE corrected file in a single ```tsx code block."""
 
 
 # =============================================================================
-# ReAct self-verifying fix loop (VerifyAgent._fix_with_agent)
+# ReAct self-verifying fix loop (FixAgent._run_react)
 # =============================================================================
 
 BUILD_FIX_SYSTEM = """You are an expert React Native TypeScript developer debugging a TypeScript build failure.

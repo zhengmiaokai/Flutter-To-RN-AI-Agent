@@ -1,7 +1,11 @@
-"""orchestration/pipeline — 5-phase LangGraph StateGraph multi-agent pipeline.
+"""orchestration/pipeline — 5-phase LangGraph StateGraph conversion pipeline.
 
 Builds a compiled LangGraph StateGraph where:
-- Each pipeline phase is a graph node (setup → scan → convert/reflect → verify)
+- Each pipeline phase is a graph node (setup → scan → copy_assets →
+  convert/reflect → verify)
+- Phase nodes are deterministic orchestration; the only agent node is
+  agents.fix_agent.FixAgent, delegated by VerifyPhase (verify.py) inside the
+  verify→fix retry loop
 - Nodes communicate through typed shared state
 - Conditional edges handle the verify→fix retry loop
 - JSON-file-backed state persistence for checkpoint/resume
@@ -10,7 +14,7 @@ Key LangGraph concepts:
 - StateGraph with TypedDict state schema
 - add_node / add_edge / add_conditional_edges for graph topology
 - Compile + invoke for execution
-- Multi-agent collaboration through shared state
+- Deterministic phase nodes + a single ReAct agent (FixAgent) for build-error fixing
 - Conditional routing for retry loops
 """
 
@@ -26,15 +30,17 @@ from typing import Any, TypedDict
 from rich.console import Console
 
 from framework.config import Config
+from framework.file_categories import infer_file_category
 from framework.harness import BudgetExceededError, Harness
 from framework.memory import MemoryStore
 from framework.state import StateManager
 from framework.state_machine import StateMachine, StepResult, StepStatus
-from agents.scan_agent import ScanAgent
-from agents.convert_agent import ConvertAgent
-from agents.verify_agent import VerifyAgent
-from agents.reflect_agent import ReflectAgent
 from framework.rag import RAGEngine
+from agents.fix_agent import FixAgent
+from skills.scan_skill import ScanSkill
+from skills.convert_skill import ConvertSkill
+from skills.reflect_skill import ReflectSkill
+from orchestration.verify import VerifyPhase
 from orchestration.setup import ProjectSetup
 
 from langgraph.graph import END, StateGraph
@@ -173,7 +179,7 @@ class Pipeline:
 
         console.print("[bold]Phase 2: Scan & Classify[/bold]")
 
-        scanner = ScanAgent(self._config, harness=self._harness, scan_mode=self._config.scan_mode)
+        scanner = ScanSkill(self._config, harness=self._harness, scan_mode=self._config.scan_mode)
         groups = scanner.scan()
 
         # Convert Paths to strings for JSON-safe state
@@ -252,11 +258,11 @@ class Pipeline:
             console.print("  [yellow]No convertible source files found.[/yellow]")
             return {"convert_done": True, "converted_count": 0, "failed_count": 0}
 
-        converter = ConvertAgent(self._config, harness=self._harness, state=self._state)
-        reflector = ReflectAgent(self._config, self._harness)
+        converter = ConvertSkill(self._config, harness=self._harness, state=self._state)
+        reflector = ReflectSkill(self._config, self._harness)
 
         # Build project-wide file registry for context-aware conversion
-        from agents.convert_agent import build_file_registry, CATEGORY_MAP
+        from skills.convert_skill import build_file_registry, CATEGORY_MAP
         file_groups_paths: dict[str, list[Path]] = {}
         for cat in ["screens", "widgets", "services", "models", "providers", "utils"]:
             file_groups_paths[cat] = [Path(p) for p in groups_raw.get(cat, [])]
@@ -325,7 +331,7 @@ class Pipeline:
                 self._state, self._memory, registry, source_root,
             )
 
-        # Index converted TS files for VerifyAgent's RAG type retrieval
+        # Index converted TS files for VerifyPhase's RAG type retrieval
         if self._rag.is_indexed:
             ts_hash = _compute_ts_dir_hash(self._config.target_dir)
             rag_index_state = self._state.get_phase_data("rag_index")
@@ -360,7 +366,8 @@ class Pipeline:
         # true" alongside "fixed: false" files from a prior failed attempt).
         self._state.clear_phase_files("verify")
 
-        verifier = VerifyAgent(self._config, harness=self._harness)
+        verifier = VerifyPhase(self._config, harness=self._harness)
+        verifier.set_fix_agent(FixAgent(self._config, harness=self._harness))
         if self._rag.is_indexed:
             verifier.set_rag_engine(self._rag)
         if self._memory is not None:
@@ -600,7 +607,7 @@ def _compute_ts_dir_hash(target_dir: str) -> str:
 
 
 def _convert_one_file(
-    converter: ConvertAgent,
+    converter: ConvertSkill,
     category: str,
     src_path: Path,
     state_mgr: StateManager,
@@ -611,7 +618,7 @@ def _convert_one_file(
         return True
 
     # Determine output path from category mapping
-    from agents.convert_agent import CATEGORY_MAP
+    from skills.convert_skill import CATEGORY_MAP
     mapping = CATEGORY_MAP.get(category)
     output_rel = None
     if mapping:
@@ -675,7 +682,7 @@ def _compute_deps_hash(original: str, src_name: str, registry, name_map: dict) -
     its dependencies are unchanged — otherwise a modified model file would
     mask a regression in a screen that depends on it.
     """
-    from agents.convert_agent import find_companion_context
+    from skills.convert_skill import find_companion_context
     h = hashlib.md5()
     h.update(original.encode("utf-8"))
     companions = find_companion_context(src_name, registry, source_code=original)
@@ -693,8 +700,8 @@ def _compute_deps_hash(original: str, src_name: str, registry, name_map: dict) -
 
 def _run_reflection(
     cfg: Config,
-    converter: ConvertAgent,
-    reflector: ReflectAgent,
+    converter: ConvertSkill,
+    reflector: ReflectSkill,
     sample_items: list[tuple[str, Path]],
     state_mgr: StateManager | None,
     memory: MemoryStore | None,
@@ -773,8 +780,8 @@ def _record_memory_pass(
 
 def _handle_reflect_result(
     cfg: Config,
-    converter: ConvertAgent,
-    reflector: ReflectAgent,
+    converter: ConvertSkill,
+    reflector: ReflectSkill,
     state_mgr: StateManager | None,
     memory: MemoryStore | None,
     category: str,
@@ -899,7 +906,7 @@ def _build_project_digest(registry, target_dir: str) -> str:
     return "\n".join(lines)
 
 
-def _record_fix_memos(verifier: VerifyAgent):
+def _record_fix_memos(verifier: VerifyPhase):
     """Record fix memos (memory type ②) after a successful auto-fix cycle."""
     memory = getattr(verifier, "_memory", None)
     if memory is None or not verifier.last_fix_results:
@@ -915,7 +922,7 @@ def _record_fix_memos(verifier: VerifyAgent):
             fixed_content = Path(fp).read_text(encoding="utf-8")
         except Exception:
             continue
-        category = verifier._file_category(filename)
+        category = infer_file_category(filename)
         for code in codes:
             memory.record_fix_memo(code, category, error_message=code, fix_snippet=fixed_content)
 
@@ -936,7 +943,7 @@ def _error_signature(errors: str) -> frozenset[str]:
     )
 
 
-def _npm_install(verifier: VerifyAgent) -> StepResult:
+def _npm_install(verifier: VerifyPhase) -> StepResult:
     # Skip if node_modules already exists (saves ~30s per retry)
     target = Path(verifier.config.target_dir)
     if (target / "node_modules").exists():
@@ -950,7 +957,7 @@ def _npm_install(verifier: VerifyAgent) -> StepResult:
         return StepResult(status=StepStatus.FAILED, error=str(e))
 
 
-def _tsc_build(verifier: VerifyAgent, data: dict | None = None) -> StepResult:
+def _tsc_build(verifier: VerifyPhase, data: dict | None = None) -> StepResult:
     """Run tsc build check. Always runs tsc — no shortcuts via gave_up."""
     base = dict(data or {}).copy()
     try:
@@ -967,7 +974,7 @@ def _tsc_build(verifier: VerifyAgent, data: dict | None = None) -> StepResult:
     )
 
 
-def _auto_fix(verifier: VerifyAgent, data: dict | None) -> StepResult:
+def _auto_fix(verifier: VerifyPhase, data: dict | None) -> StepResult:
     if data is None:
         data = {"build_ok": False, "errors": ""}
     errors = data.get("errors", "")

@@ -14,9 +14,9 @@ cross-cutting concerns:
 - retry cap           : bounded total attempts on the single model
 - response_format     : json_object where the provider supports it, else degrade
 
-Not a ReAct/agentic harness — ConvertAgent proved single-shot beats a tool
+Not a ReAct/agentic harness — ConvertSkill proved single-shot beats a tool
 loop for this domain, so this layer only orchestrates single calls. Agentic
-paths (the ReAct verify-fix loop) share the same token ledger and budget via
+paths (the FixAgent ReAct fix loop) share the same token ledger and budget via
 record_usage / over_budget, but run their own loop and never flow through call.
 """
 
@@ -41,7 +41,7 @@ _CACHE_SALT = "harness-v1"
 # Max total attempts for a single logical call.
 _DEFAULT_RETRY_CAP = 3
 
-# Task names shared with the agents.
+# Task names shared with the skills and the fix agent.
 TASK_SCAN_CLASSIFY = "scan_classify"
 TASK_CONVERT = "convert"
 TASK_REFLECT = "reflect"

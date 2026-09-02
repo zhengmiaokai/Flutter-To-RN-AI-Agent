@@ -1,8 +1,13 @@
-"""agents/verify_agent — Build verification and structured error auto-fix.
+"""orchestration/verify — deterministic Verify-phase orchestration.
 
-Verifies the generated React Native project builds correctly: tsc --noEmit →
-structured error parsing → single-shot harness fix per file → re-verify via
-the pipeline StateMachine retry loop.
+Runs tsc --noEmit, parses the output into structured errors, and drives the
+fix sub-flow: it computes per-file context (RAG) + fix-memo (memory) exactly
+once and delegates the actual fixing to ``agents.fix_agent.FixAgent`` (the
+pipeline's only true agent) via setter injection.
+
+This is a plain orchestration class — NOT an agent and NOT a skill. The fix
+decision loop lives entirely inside FixAgent; VerifyPhase only routes inputs
+to it (import errors first, then declaration/type/syntax/unused/other).
 """
 
 from __future__ import annotations
@@ -12,33 +17,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from langchain_core.messages import HumanMessage
+from rich.console import Console
 
 from framework.config import Config
 from framework.harness import BudgetExceededError
-from agents.base import BaseAgent
-from tools import VERIFY_FIX_TOOLS
-from prompts.verify import (
-    BUILD_FIX_SYSTEM,
-    get_fix_prompt,
-    HYBRID_FIX_SYSTEM,
-    get_hybrid_fix_prompt,
-)
-
-# Cap on source code sent to the fix prompt (bounds per-call token cost).
-_MAX_FIX_SOURCE_CHARS = 16000
-
-_CODE_BLOCK_RE = re.compile(
-    r"```(?:tsx|typescript|ts|jsx|javascript|js|json)\n(.*?)```",
-    re.DOTALL,
-)
-
-
-def _extract_code_block(text: str) -> str | None:
-    """Extract the first fenced code block from an LLM response."""
-    m = _CODE_BLOCK_RE.search(text or "")
-    return m.group(1).strip() if m else None
-
 
 # =============================================================================
 # Structured tsc error types
@@ -177,28 +159,30 @@ def parse_tsc_errors(output: str, target_dir: str = "") -> TscErrorGroup:
 
 
 # =============================================================================
-# VerifyAgent
+# VerifyPhase
 # =============================================================================
 
 
-class VerifyAgent(BaseAgent):
-    """Agent that verifies the generated React Native project builds correctly.
+class VerifyPhase:
+    """Deterministic Verify-phase orchestration (tsc → parse → route to fix).
 
-    Fixes build errors with a single-shot harness call per file (no tool
-    loop), enhanced with:
-    - Structured tsc error parsing and categorization
-    - Priority-ordered multi-file fixing (import errors first)
-    - Cross-file context for import resolution
-    - RAG-based type definition retrieval and fix-memo injection
+    Fixes are performed by ``agents.fix_agent.FixAgent`` (injected via
+    ``set_fix_agent``). VerifyPhase computes cross-file context and fix-memos
+    once per file and hands them to the agent — it never fixes files itself.
     """
 
     def __init__(self, config: Config, harness=None):
-        super().__init__(config, harness)
+        self.config = config
+        self.harness = harness
+        self.console = Console()
         self._target = Path(config.target_dir)
         # Populated after each _auto_fix cycle: {filename: {fixed, error_categories, ...}}
         self.last_fix_results: dict[str, dict] = {}
         self._rag_engine = None
         self._memory = None
+        self._fix_agent = None  # injected via set_fix_agent
+
+    # ---- injection ---------------------------------------------------------
 
     def set_rag_engine(self, engine):
         """Attach a RAG engine for semantic type definition retrieval."""
@@ -208,14 +192,32 @@ class VerifyAgent(BaseAgent):
         """Attach the memory store for fix-memo injection (advisory only)."""
         self._memory = store
 
+    def set_fix_agent(self, agent):
+        """Inject the FixAgent that performs the actual fix loop."""
+        self._fix_agent = agent
+
+    # ---- logging -----------------------------------------------------------
+
+    def log_info(self, tag: str, message: str):
+        self.console.print(f"[cyan][{tag}][/cyan] {message}")
+
+    def log_success(self, tag: str, message: str):
+        self.console.print(f"[green][{tag}][/green] {message}")
+
+    def log_warn(self, tag: str, message: str):
+        self.console.print(f"[yellow][{tag}][/yellow] {message}")
+
+    def log_error(self, tag: str, message: str):
+        self.console.print(f"[red][{tag}][/red] {message}")
+
     # ---- Structured error fix -------------------------------------------------
 
     def _auto_fix(self, errors: str) -> int:
         """Auto-fix build errors with a structured per-file pass.
 
         Parses tsc errors into structured groups, orders files by fix
-        priority (import errors first), and fixes each file with a single
-        harness call.
+        priority (import errors first), and delegates each file's fix to
+        the injected FixAgent.
         """
         # Parse errors into structured groups
         error_group = parse_tsc_errors(errors, str(self._target))
@@ -268,7 +270,7 @@ class VerifyAgent(BaseAgent):
                 f"  {e.line}:{e.col} [{e.code}] {e.message}" for e in file_errors
             )
 
-            fixed = self._fix_with_agent(
+            fixed = self._fix_file(
                 file_path=file_path,
                 errors=file_error_text,
                 filename=filename,
@@ -418,7 +420,7 @@ class VerifyAgent(BaseAgent):
                 return idx
         return None
 
-    # ---- Enhanced per-file fix ------------------------------------------------
+    # ---- Thin dispatcher to the injected FixAgent -----------------------------
 
     def _fix_file(
         self,
@@ -428,212 +430,30 @@ class VerifyAgent(BaseAgent):
         file_error_group: Optional[list[TscError]] = None,
         cross_file_context: str = "",
     ) -> bool:
-        """Fix a single file with a single-shot harness call (no tool loop).
+        """Route one file's fix to the injected FixAgent.
 
-        One harness.call(task_type="verify_fix") returns the complete
-        corrected file, which we write and let the outer StateMachine verify
-        with tsc. Works with any model, including reasoning-type models that
-        lack function calling.
+        Computes the fix-memo once per file and hands context + memo to
+        ``FixAgent.fix`` (which runs the ReAct loop or its single-shot
+        degraded mode internally). BudgetExceededError propagates — the
+        pipeline stops the verify phase (gave_up) instead of looping without
+        tokens.
         """
-        try:
-            source = file_path.read_text(encoding="utf-8")
-        except Exception:
+        if self._fix_agent is None:
             return False
 
-        prompt = get_hybrid_fix_prompt(
-            source[:_MAX_FIX_SOURCE_CHARS],
-            errors,
-            filename,
-            cross_file_context,
-        )
-
-        # Inject known fixes from previous runs for this error code (advisory)
+        memo = ""
         if self._memory is not None and file_error_group:
             codes = sorted({e.code for e in file_error_group})
             memo = self._memory.query_fix_memos(codes)
-            if memo:
-                prompt += f"\n\n{memo}"
 
-        try:
-            if not self.harness:
-                return False
-            result = self.harness.call(
-                task_type="verify_fix",
-                system_prompt=HYBRID_FIX_SYSTEM,
-                user_message=prompt,
-                temperature=0.2,
-                category=self._file_category(filename),
-            )
-        except Exception as exc:
-            self.log_warn("Verify", f"Fix call failed for {filename}: {exc}")
-            return False
-
-        code = _extract_code_block(result.content)
-        if not code or len(code) < 50:
-            self.log_warn("Verify", f"No valid fix produced for {filename}")
-            return False
-
-        file_path.write_text(code, encoding="utf-8")
-        self.log_info("Verify", f"Applied hybrid fix to {filename}")
-        return True
-
-    # ---- ReAct self-verifying fix --------------------------------------------
-
-    def _fix_with_agent(
-        self,
-        file_path: Path,
-        errors: str,
-        filename: str,
-        file_error_group: Optional[list[TscError]] = None,
-        cross_file_context: str = "",
-    ) -> bool:
-        """Fix a single file with a self-verifying ReAct tool loop.
-
-        The agent is given read_source_file / write_output_file /
-        run_tsc_check / run_build_check so it can read companion files, write
-        the fix, and run tsc to verify BEFORE returning — unlike the
-        single-shot path, which writes blindly and lets the outer loop catch
-        failures. Falls back to single-shot `_fix_file` when the ReAct agent
-        is unavailable (e.g. model without function calling) or produced no
-        write.
-        """
-        try:
-            source = file_path.read_text(encoding="utf-8")
-        except Exception:
-            return False
-
-        prompt = get_fix_prompt(source, errors, filename)
-        if cross_file_context:
-            prompt += f"\n\n## Companion File Context (exports from imported files)\n{cross_file_context}"
-
-        # Inject known fixes from previous runs for this error code (advisory)
-        if self._memory is not None and file_error_group:
-            codes = sorted({e.code for e in file_error_group})
-            memo = self._memory.query_fix_memos(codes)
-            if memo:
-                prompt += f"\n\n{memo}"
-
-        if self.llm is None:
-            return self._fix_file(
-                file_path, errors, filename, file_error_group, cross_file_context,
-            )
-
-        # Budget guard: the ReAct loop's internal calls bypass Harness.call, so
-        # consult the shared ledger once up front. Exhausted → abort the loop
-        # and let the pipeline stop the verify phase (gave_up) instead of
-        # burning more tokens. Raised before the try so the single-shot
-        # fallback below isn't triggered (it would fail identically).
-        if self.harness is not None and self.harness.over_budget():
-            raise BudgetExceededError(
-                f"Token budget ({self.config.token_budget}) exhausted — "
-                f"skipping ReAct fix for {filename}."
-            )
-
-        # ReAct agent with self-verification tools
-        abs_path = str(file_path.resolve())
-        abs_target = str(self._target.resolve())
-        route = self.config.route_for("verify_fix")
-        try:
-            agent = self.create_agent(
-                tools=VERIFY_FIX_TOOLS,
-                system_prompt=BUILD_FIX_SYSTEM,
-                name="fix_agent",
-                model=route.model,
-                base_url=route.base_url,
-                api_key=route.api_key,
-            )
-            result = agent.invoke(
-                {
-                    "messages": [
-                        HumanMessage(
-                            content=(
-                                f"Fix the build errors in {filename}.\n\n{prompt}\n\n"
-                                f"## Instructions\n"
-                                f"1. Read the file: use read_source_file('{abs_path}')\n"
-                                f"2. Write the corrected file: use write_output_file "
-                                f"(output_path='{abs_path}')\n"
-                                f"3. Verify: use run_tsc_check(target_dir='{abs_target}').\n"
-                                f"   If node_modules are missing, first use "
-                                f"run_build_check(target_dir='{abs_target}').\n"
-                                f"4. If BUILD_ERRORS remain, read the file again and "
-                                f"fix, then verify again.\n"
-                                f"5. Stop when run_tsc_check returns BUILD_OK.\n"
-                                f"Target directory: {abs_target}"
-                            )
-                        ),
-                    ]
-                },
-                config={"recursion_limit": 20},
-            )
-        except Exception as exc:
-            self.log_warn("Verify", f"ReAct fix failed for {filename}: {exc}")
-            return self._fix_file(
-                file_path, errors, filename, file_error_group, cross_file_context,
-            )
-
-        # Record aggregated usage for the agent's internal model calls
-        self._record_agent_usage(result, route.model, filename)
-
-        # Success = the agent wrote at least one file via the write tool
-        if self._agent_wrote_file(result):
-            self.log_info("Verify", f"ReAct fix applied to {filename}")
-            return True
-
-        # Fallback 1: extract a fenced code block from the final message
-        messages = result.get("messages", []) or []
-        final_content = ""
-        if messages:
-            final_content = getattr(messages[-1], "content", "") or ""
-        code = _extract_code_block(str(final_content))
-        if code and len(code) >= 50:
-            file_path.write_text(code, encoding="utf-8")
-            self.log_info("Verify", f"ReAct fix applied to {filename} (code block)")
-            return True
-
-        # Fallback 2: single-shot harness fix (cheap last attempt)
-        self.log_warn(
-            "Verify",
-            f"ReAct agent produced no write for {filename}; falling back to single-shot",
+        return self._fix_agent.fix(
+            file_path=file_path,
+            errors=errors,
+            filename=filename,
+            target_dir=self._target,
+            cross_file_context=cross_file_context,
+            memo=memo,
         )
-        return self._fix_file(
-            file_path, errors, filename, file_error_group, cross_file_context,
-        )
-
-    @staticmethod
-    def _agent_wrote_file(result: dict) -> bool:
-        """True if the ReAct agent called write_output_file at least once."""
-        for msg in result.get("messages", []) or []:
-            for tc in getattr(msg, "tool_calls", None) or []:
-                if isinstance(tc, dict) and tc.get("name") == "write_output_file":
-                    return True
-            # Older serializations keep tool calls under additional_kwargs
-            ak = getattr(msg, "additional_kwargs", None) or {}
-            for tc in ak.get("tool_calls", []) or []:
-                if (
-                    isinstance(tc, dict)
-                    and tc.get("function", {}).get("name") == "write_output_file"
-                ):
-                    return True
-        return False
-
-    def _record_agent_usage(self, result: dict, model: str, filename: str):
-        """Best-effort aggregated token accounting for the ReAct agent's calls."""
-        if self.harness is None:
-            return
-        prompt_tokens = 0
-        completion_tokens = 0
-        for msg in result.get("messages", []) or []:
-            um = getattr(msg, "usage_metadata", None) or {}
-            prompt_tokens += int(um.get("input_tokens", 0) or 0)
-            completion_tokens += int(um.get("output_tokens", 0) or 0)
-        if prompt_tokens + completion_tokens > 0:
-            self.harness.record_usage(
-                task_type="verify_fix",
-                model=model,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                category=self._file_category(filename),
-            )
 
     # ---- Standard build steps (used by StateMachine) ------------------------
 
@@ -698,13 +518,3 @@ class VerifyAgent(BaseAgent):
                 return candidates[0]
 
         return None
-
-    @staticmethod
-    def _file_category(filename: str) -> str:
-        """Infer the category from a target-relative path (for routing/memos)."""
-        norm = "/" + str(filename).replace("\\", "/") + "/"
-        for cat in ("screens", "widgets", "providers", "services", "models", "utils"):
-            if f"/{cat}/" in norm:
-                return cat
-        return "other"
-

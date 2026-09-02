@@ -1,4 +1,4 @@
-"""prompts/scanner — Lightweight batch classification prompt for ScanAgent.
+"""prompts/scanner — Lightweight batch classification prompt for ScanSkill.
 
 Files are classified in batches (not one-by-one) so the system prompt
 is amortized across many files and the model can make consistent

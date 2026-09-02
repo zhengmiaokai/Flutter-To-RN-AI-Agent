@@ -1,12 +1,12 @@
-"""agents/convert_agent — Convert Flutter source files to React Native (optimized).
+"""skills/convert_skill — Convert Flutter source files to React Native (optimized).
 
-Uses single-shot LLM calls instead of ReAct agents — the source code is already
-read before the call, so the tool-calling loop adds only token cost and latency
-without benefit. Per-category system prompts avoid sending irrelevant mapping
-tables (e.g. models don't need widget or navigation mappings).
+Single-shot capability (no agent loop): the source code is already read
+before the call, so a tool-calling loop would add only token cost and
+latency without benefit. Per-category system prompts avoid sending irrelevant
+mapping tables (e.g. models don't need widget or navigation mappings).
 
 RAG enhancement:
-  When a RAGEngine is provided via set_rag_engine(), the agent also retrieves
+  When a RAGEngine is provided via set_rag_engine(), the skill also retrieves
   semantically related code chunks from the project index and appends them as
   context. This replaces the basic filename-based companion context lookup
   with cross-file semantic understanding.
@@ -24,7 +24,7 @@ from pathlib import Path
 
 from framework.config import Config
 from framework.state import StateManager
-from agents.base import BaseAgent
+from skills.base import BaseSkill
 from prompts import build_category_system_prompt, get_conversion_prompt
 
 # Registry: dart filename → output info
@@ -194,14 +194,24 @@ CATEGORY_MAP: dict[str, tuple[str, str]] = {
 }
 
 
-class ConvertAgent(BaseAgent):
-    """Agent that converts Flutter files into React Native modules.
+class ConvertSkill(BaseSkill):
+    """Skill that converts Flutter files into React Native modules.
 
     Optimized for token efficiency — uses a single LLM call per file with
     a category-specific system prompt (no ReAct tool-calling overhead).
     The source code is embedded directly in the prompt; the LLM returns
     converted code in a ```tsx/ts code block which we extract and write.
+
+    Contract: ``convert_file(category, src_path, reflection_feedback=None)``
+    writes the converted file under ``config.target_dir`` (no return value).
     """
+
+    name = "convert"
+    description = (
+        "Convert a single Flutter Dart file into a React Native TypeScript/"
+        "TSX module via a single LLM call with a category-specific system "
+        "prompt (optionally RAG-enhanced cross-file context)."
+    )
 
     def __init__(self, config: Config, harness=None, state: StateManager | None = None):
         super().__init__(config, harness)
@@ -216,7 +226,7 @@ class ConvertAgent(BaseAgent):
     def set_rag_engine(self, engine: "RAGEngine"):  # noqa: F821
         """Attach a RAG engine for semantic context retrieval.
 
-        When set, the agent retrieves semantically related code chunks
+        When set, the skill retrieves semantically related code chunks
         from the project index and includes them in the conversion prompt,
         replacing the basic filename-based companion context lookup.
         """
@@ -326,7 +336,7 @@ class ConvertAgent(BaseAgent):
         )
 
         if not self.harness:
-            raise RuntimeError("ConvertAgent requires a harness.")
+            raise RuntimeError("ConvertSkill requires a harness.")
 
         # Single LLM call — no ReAct agent overhead. cache=True dedupes
         # re-conversion of unchanged inputs; cache_validator only stores
@@ -368,4 +378,3 @@ class ConvertAgent(BaseAgent):
                 output_path.write_text(code, encoding="utf-8")
         else:
             self.log_warn("Convert", f"LLM returned text instead of code for {src_path.name}")
-

@@ -1,9 +1,8 @@
-"""agents/scan_agent — Hybrid file scanner (rule-based + AI enhancement).
+"""skills/scan_skill — hybrid file scanner (rule-based + AI enhancement).
 
-Two-phase approach:
-1. Fast rule-based pass (directory heuristics) — unchanged from original.
-2. Optional AI pass that batch-classifies uncertain files by analyzing actual
-   source content, catching files in non-standard directory structures.
+Single-shot capability (no agent loop): a fast rule-based pass over the
+directory plus an optional batched AI pass that reclassifies uncertain files
+by content.
 
 Three scan modes:
 - ``fast``  — rule-based only, zero AI cost (original behavior)
@@ -21,9 +20,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from rich.console import Console
-
 from framework.config import Config
+from skills.base import BaseSkill
 from tools import scan_source_directory
 from prompts.scanner import BATCH_CLASSIFY_SYSTEM, build_batch_prompt
 
@@ -44,7 +42,7 @@ _MAX_PREVIEW_LINES = 20
 _BATCH_SIZE = 50
 
 
-class ScanAgent:
+class ScanSkill(BaseSkill):
     """Scans a Flutter project directory and classifies files by category.
 
     Two-phase classification:
@@ -52,7 +50,16 @@ class ScanAgent:
     2. Optional AI batch pass that reclassifies uncertain files by content.
 
     Pass ``scan_mode="fast"`` to skip the AI pass entirely.
+
+    Contract: ``scan() -> dict[str, list[Path]]`` — category → file list.
     """
+
+    name = "scan"
+    description = (
+        "Scan a Flutter source directory and classify files by category "
+        "(screens/widgets/services/models/providers/utils/...) using a "
+        "rule-based pass plus an optional batched AI reclassification."
+    )
 
     def __init__(
         self,
@@ -60,11 +67,8 @@ class ScanAgent:
         harness=None,
         scan_mode: str | None = None,
     ):
-        self.config = config
-        self.harness = harness
-        self.llm = harness.llm if harness is not None else None
+        super().__init__(config, harness)
         self.scan_mode = scan_mode or config.scan_mode
-        self.console = Console()
 
     # ---- public API ---------------------------------------------------------
 
@@ -77,13 +81,13 @@ class ScanAgent:
         Returns:
             { "screens": [Path(...)], "widgets": [...], ... }
         """
-        self._log_info("ScanAgent", f"Starting scan (mode={self.scan_mode})...")
+        self.log_info("ScanAgent", f"Starting scan (mode={self.scan_mode})...")
 
         result_json = scan_source_directory.invoke({"source_dir": self.config.source_dir})
         try:
             parsed = json.loads(result_json)
         except json.JSONDecodeError:
-            self._log_error("ScanAgent", "Failed to parse scan result")
+            self.log_error("ScanAgent", "Failed to parse scan result")
             return {}
 
         # Convert file path strings back to Path objects
@@ -96,9 +100,9 @@ class ScanAgent:
         if self.scan_mode != "fast" and self.llm is not None:
             moved = self._enhance_with_ai(groups)
             if moved:
-                self._log_info("ScanAgent", f"AI reclassified {moved} file(s)")
+                self.log_info("ScanAgent", f"AI reclassified {moved} file(s)")
         else:
-            self._log_info("ScanAgent", "Enhancement skipped")
+            self.log_info("ScanAgent", "Enhancement skipped")
 
         self._print_summary(groups)
         return groups
@@ -171,7 +175,7 @@ class ScanAgent:
             previews.append((fp.name, str(fp), cur, preview))
 
         prompt = build_batch_prompt(previews)
-        self._log_dim(f"  →  batch[{len(files)}]", f"{files[0].name} (+{len(files)-1} more)")
+        self.log_dim(f"  →  batch[{len(files)}]", f"{files[0].name} (+{len(files)-1} more)")
 
         try:
             if not self.harness:
@@ -185,12 +189,12 @@ class ScanAgent:
             )
             raw = result.content.strip()
         except Exception as exc:
-            self._log_warn("  classify-err", str(exc)[:120])
+            self.log_warn("  classify-err", str(exc)[:120])
             return None
 
         parsed = self._parse_json_response(raw)
         if parsed is None:
-            self._log_warn("  classify-unk", f"unexpected response: {raw[:150]}...")
+            self.log_warn("  classify-unk", f"unexpected response: {raw[:150]}...")
             return None
 
         # Build full-path keyed lookup with fallback matching
@@ -199,7 +203,7 @@ class ScanAgent:
         for key, cat in parsed.items():
             cat_clean = cat.strip().lower()
             if cat_clean not in CATEGORIES:
-                self._log_dim(f"  skip  {key}", f"unknown category: {cat_clean}")
+                self.log_dim(f"  skip  {key}", f"unknown category: {cat_clean}")
                 continue
 
             key_str = str(key).strip()
@@ -215,7 +219,7 @@ class ScanAgent:
                     validated[full_path] = cat_clean
                     break
             else:
-                self._log_dim(f"  skip  {key}", "no matching file in this batch")
+                self.log_dim(f"  skip  {key}", "no matching file in this batch")
 
         return validated
 
@@ -302,18 +306,6 @@ class ScanAgent:
     def _print_summary(self, groups: dict[str, list[Path]]):
         for category, files in groups.items():
             if files:
-                self._log_info("ScanAgent", f"  [{category}] {len(files)} file(s)")
+                self.log_info("ScanAgent", f"  [{category}] {len(files)} file(s)")
         total = self.get_file_count(groups)
-        self._log_info("ScanAgent", f"  Total: {total} file(s) found")
-
-    def _log_info(self, tag: str, message: str):
-        self.console.print(f"[cyan][{tag}][/cyan] {message}")
-
-    def _log_dim(self, tag: str, message: str):
-        self.console.print(f"[dim][{tag}][/dim] {message}")
-
-    def _log_warn(self, tag: str, message: str):
-        self.console.print(f"[yellow][{tag}][/yellow] {message}")
-
-    def _log_error(self, tag: str, message: str):
-        self.console.print(f"[red][{tag}][/red] {message}")
+        self.log_info("ScanAgent", f"  Total: {total} file(s) found")

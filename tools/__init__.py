@@ -24,7 +24,7 @@ from langchain_core.tools import tool
 # Tool 1: Scan and classify Flutter files
 # =============================================================================
 
-# Classification constants (reused from original scan_agent)
+# Classification constants (reused by ScanSkill)
 SCREEN_DIRS = {"pages", "screens", "views"}
 WIDGET_DIRS = {"components", "widgets", "shared", "common"}
 SERVICE_DIRS = {"services", "api", "network", "channels"}

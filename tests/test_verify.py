@@ -1,12 +1,12 @@
-"""tests/test_verify_agent — VerifyAgent error parsing + ReAct fix-loop helpers.
+"""tests/test_verify — VerifyPhase parsing + verify-loop control flow.
 
-Pure-logic tests only (no LLM calls): structured tsc parsing, the pipeline's
-no-progress error signature, the ReAct write-detection helper, and the verify
+Pure-logic tests only (no LLM calls): structured tsc parsing, the verify
+loop's no-progress detection (_auto_fix / _error_signature), and the verify
 StateMachine topology (gave_up short-circuit vs success loop-back).
 """
 from types import SimpleNamespace
 
-from agents.verify_agent import VerifyAgent, parse_tsc_errors
+from orchestration.verify import parse_tsc_errors
 from framework.state_machine import StateMachine, StepResult, StepStatus
 from orchestration.pipeline import _auto_fix, _error_signature
 
@@ -70,44 +70,6 @@ class TestErrorSignature:
         a = _error_signature("src/a.ts(1,1): error TS2307: x")
         b = _error_signature("src/a.ts(1,1): error TS2307: y")
         assert a == b
-
-
-class TestAgentWroteFile:
-    """ReAct write_output_file detection."""
-
-    def _agent(self, *messages):
-        return {"messages": list(messages)}
-
-    def test_detects_modern_tool_calls(self):
-        msg = SimpleNamespace(
-            tool_calls=[{"name": "write_output_file", "args": {"output_path": "/x.ts"}}],
-            additional_kwargs={},
-            content="",
-        )
-        assert VerifyAgent._agent_wrote_file(self._agent(msg)) is True
-
-    def test_detects_legacy_additional_kwargs(self):
-        msg = SimpleNamespace(
-            tool_calls=[],
-            additional_kwargs={
-                "tool_calls": [
-                    {"function": {"name": "write_output_file", "arguments": "{}"}}
-                ]
-            },
-            content="",
-        )
-        assert VerifyAgent._agent_wrote_file(self._agent(msg)) is True
-
-    def test_ignores_other_tools(self):
-        msg = SimpleNamespace(
-            tool_calls=[{"name": "run_tsc_check", "args": {"target_dir": "/x"}}],
-            additional_kwargs={},
-            content="",
-        )
-        assert VerifyAgent._agent_wrote_file(self._agent(msg)) is False
-
-    def test_empty(self):
-        assert VerifyAgent._agent_wrote_file({"messages": []}) is False
 
 
 class TestVerifyLoopRouting:

@@ -5,7 +5,8 @@ Powered by LangChain + LangGraph:
 - Utility tools:        @tool-decorated functions in tools/__init__.py
 - State persistence:    JSON-file-backed checkpoint/resume
 - Workflow state:       StateGraph with typed state + conditional edges
-- Multi-agent:          4 agents as graph nodes sharing a PipelineState
+- Capability layer:     skills/ (single-shot) + agents/fix_agent.py (the only
+                        ReAct agent), wired by orchestration/ phases
 
 Usage:
     python3 main.py                          # uses ./sample → ./output

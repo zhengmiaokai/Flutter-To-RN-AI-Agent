@@ -1,7 +1,8 @@
-"""agents/reflect_agent — Self-correction for conversion quality review.
+"""skills/reflect_skill — self-correction for conversion quality review.
 
-Reviews conversion quality via a harness LLM call with JSON output. Compares
-original Flutter against converted React Native and identifies gaps.
+Single-shot capability (no agent loop): reviews conversion quality via a
+harness LLM call with JSON output. Compares original Flutter against
+converted React Native and identifies gaps.
 
 Optimizations over the original single-call path:
 - json_object response format (fallback to plain JSON parsing when the
@@ -19,7 +20,7 @@ import re
 from pydantic import BaseModel, Field, ConfigDict
 
 from framework.config import Config
-from agents.base import BaseAgent
+from skills.base import BaseSkill
 
 _REFLECT_SYSTEM = """You are an expert code reviewer specializing in Flutter to React Native migrations.
 
@@ -186,8 +187,20 @@ def _normalize_issues(raw_issues: list) -> list[dict]:
     return raw_issues
 
 
-class ReflectAgent(BaseAgent):
-    """Agent that reviews conversion output quality and triggers rework."""
+class ReflectSkill(BaseSkill):
+    """Skill that reviews conversion output quality and triggers rework.
+
+    Contract: ``reflect(rn_code, flutter_source, filename) -> ReflectResult``
+    and ``reflect_batch(items) -> dict[key, ReflectResult]`` (single-shot,
+    batched LLM calls with per-file fallback on parse failure).
+    """
+
+    name = "reflect"
+    description = (
+        "Review a Flutter→RN conversion's quality against the original source "
+        "(8-dimension check, 0-100 score) via a single-shot LLM call; supports "
+        "batched review of multiple files in one call."
+    )
 
     def __init__(self, config: Config, harness=None):
         super().__init__(config, harness)

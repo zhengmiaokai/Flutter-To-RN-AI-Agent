@@ -1,6 +1,6 @@
-"""tests/test_convert_agent — Tests for the ConvertAgent category dispatch.
+"""tests/test_convert_skill — Tests for the ConvertSkill category dispatch.
 
-Tests that the agent correctly dispatches files by category to the
+Tests that the skill correctly dispatches files by category to the
 correct output directories using the single-shot harness path.
 """
 
@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from framework.config import Config
-from agents.convert_agent import ConvertAgent
+from skills.convert_skill import ConvertSkill
 
 
 class FakeHarness:
@@ -24,12 +24,12 @@ class FakeHarness:
         return SimpleNamespace(content=self._content)
 
 
-class TestConvertAgentDispatch:
+class TestConvertSkillDispatch:
     """Tests for convert_file category dispatch."""
 
     @pytest.fixture
     def mock_agent(self, tmp_path):
-        """Create a ConvertAgent with a fake harness returning a code block."""
+        """Create a ConvertSkill with a fake harness returning a code block."""
         config = Config(
             source_dir=".",
             target_dir=str(tmp_path),
@@ -37,7 +37,7 @@ class TestConvertAgentDispatch:
         )
         harness = FakeHarness("```tsx\nconst App = () => <View />;\n```")
         mock_state = MagicMockLike()
-        return ConvertAgent(config, harness, mock_state)
+        return ConvertSkill(config, harness, mock_state)
 
 
 class MagicMockLike:

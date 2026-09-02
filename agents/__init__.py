@@ -1,20 +1,19 @@
 """agents — Agent layer for the Flutter-to-RN conversion pipeline.
 
-ScanAgent uses hybrid rule-based + optional LLM classification.
-ConvertAgent, ReflectAgent, and VerifyAgent all drive single-shot
-harness.call() calls instead of ReAct tool loops — the pipeline's
-build/verify retry loop handles correctness checking deterministically.
+FixAgent is the only true agent: a LangGraph ReAct loop (read → write → tsc →
+iterate) that fixes TypeScript build errors with a hard feedback signal. The
+single-shot scan/convert/reflect capabilities moved to skills/ — they are
+deterministic single ``harness.call()`` steps with no tool loop.
+
+Dependency rule: agents do not import skills, and skills do not import
+agents; orchestration/verify.py is the only place that wires them together
+(via set_fix_agent setter injection).
 """
 
-from agents.convert_agent import ConvertAgent
-from agents.verify_agent import VerifyAgent
-from agents.reflect_agent import ReflectAgent, ReflectResult
-from agents.scan_agent import ScanAgent
+from agents.base import BaseAgent
+from agents.fix_agent import FixAgent
 
 __all__ = [
-    "ConvertAgent",
-    "VerifyAgent",
-    "ReflectAgent",
-    "ReflectResult",
-    "ScanAgent",
+    "BaseAgent",
+    "FixAgent",
 ]

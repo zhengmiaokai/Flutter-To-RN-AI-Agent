@@ -10,7 +10,7 @@ Architecture:
     ├─ Retriever   (query → relevant Document chunks)
     └─ Formatter   (Documents → compact prompt context)
 
-This is a drop-in enhancement for ConvertAgent: it replaces the
+This is a drop-in enhancement for ConvertSkill: it replaces the
 filename-based find_companion_context() with semantic retrieval.
 """
 
@@ -276,12 +276,12 @@ class RAGEngine:
         ids = self._vectorstore.add_documents(all_docs)
         return len(ids)
 
-    # ── TS output file indexing (for VerifyAgent type retrieval) ──────────
+    # ── TS output file indexing (for VerifyPhase type retrieval) ──────────
 
     def index_ts_files(self, output_dir: str) -> int:
         """Index all .ts/.tsx files in the output directory.
 
-        This is called after conversion is complete, so that VerifyAgent
+        This is called after conversion is complete, so that VerifyPhase
         can retrieve type definitions from the generated RN code when
         fixing tsc errors.
 
